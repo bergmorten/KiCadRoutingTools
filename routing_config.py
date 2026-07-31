@@ -4,7 +4,7 @@ Configuration classes and coordinate utilities for PCB routing.
 from __future__ import annotations
 
 import math
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Set, Tuple, Dict
 from dataclasses import dataclass, field
 
 from routing_constants import FORBIDDEN_LAYER_COST
@@ -269,6 +269,17 @@ class GridRouteConfig:
     # at least the class spacing to it (get_net_clearance() is the #326-only view).
     net_clearances: Dict[int, float] = field(default_factory=dict)
     net_clearance_floor: Optional[float] = None
+    # Nets whose clearance is a SAFETY floor, not a routing preference, so the
+    # rescue ladder must never neck them below it (#541).
+    #
+    # The neck-down rungs in net_rescue trade spacing for completion and grade
+    # DRC afterwards, which is the right trade for a signal net: a DRC flag is
+    # cheaper than an unrouted net. It is the WRONG trade for a creepage class
+    # on a high-voltage net, where the clearance IS the requirement and a
+    # necked route is not a worse route but an unusable one. For these nets an
+    # honest "unrouted" is the correct outcome -- it says the placement needs
+    # to change, which is true.
+    no_neck_nets: Set[int] = field(default_factory=set)
     # Per-layer clearance from the board's .kicad_dru custom rules (#498),
     # {layer_name: mm}. REPLACEMENT semantics, mirroring KiCad's precedence
     # (custom rules outrank netclasses and the CLI ceiling, tightening OR

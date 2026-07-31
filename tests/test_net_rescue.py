@@ -110,6 +110,61 @@ def test_rescue_necks_down_through_the_pinch():
     assert all(s.net_id != VICTIM for s in pcb.segments)
 
 
+def test_safety_floor_net_is_not_necked_and_comes_back_unrouted():
+    """#541: a net whose clearance is a safety floor must NOT be rescued by
+    necking below it.
+
+    Same 0.32 channel as the test above, which rescue routes only by dropping
+    below nominal clearance. With the net marked no-neck, the correct outcome
+    is UNROUTED — for creepage on a high-voltage net the clearance IS the
+    requirement, so a necked route is not a worse route but an unusable one,
+    and "unrouted" is the honest signal that the placement has to change.
+
+    Without this the board completes, the DRC flag arrives afterwards, and
+    the only remaining evidence that a safety clearance was violated is a
+    number in a report nobody has to read.
+    """
+    pcb = _board(wall_y=0.32)
+    cfg = _cfg()
+    cfg.no_neck_nets = {VICTIM}
+
+    result, used = _attempt_edge(pcb, VICTIM, _gap(pcb), cfg, None)
+
+    assert result is None, (
+        "a safety-floor net must not be completed by necking below its class"
+    )
+    assert all(s.net_id != VICTIM for s in pcb.segments), "board must be untouched"
+
+
+def test_safety_floor_marking_does_not_block_a_net_that_fits_at_nominal():
+    """The protection must cost nothing when the geometry is actually legal.
+
+    A wide channel routes at nominal, so marking the net no-neck must change
+    nothing — otherwise the flag would trade real routability for safety it
+    was not being asked to provide.
+    """
+    pcb = _board(wall_y=1.2)
+    cfg = _cfg()
+    cfg.no_neck_nets = {VICTIM}
+
+    result, used = _attempt_edge(pcb, VICTIM, _gap(pcb), cfg, None)
+
+    assert result is not None, "a net that fits at nominal must still route"
+    assert used.clearance >= cfg.clearance - 1e-9, "must have routed at nominal"
+
+
+def test_safety_floor_only_protects_the_named_net():
+    """Marking one net must not silently protect every net."""
+    pcb = _board(wall_y=0.32)
+    cfg = _cfg()
+    cfg.no_neck_nets = {WALL}  # a DIFFERENT net
+
+    result, used = _attempt_edge(pcb, VICTIM, _gap(pcb), cfg, None)
+
+    assert result is not None, "VICTIM is unprotected and must still be rescued"
+    assert used.clearance < cfg.clearance
+
+
 def test_impossible_gap_leaves_board_untouched():
     pcb = _board(wall_y=0.24)  # channel below even the fab-floor need
     segs_before = list(pcb.segments)

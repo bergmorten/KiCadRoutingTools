@@ -359,6 +359,7 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
                 return_results: bool = False,
                 pcb_data=None,
                 net_clearances: dict = None,
+                no_neck_nets: set = None,
                 keep_input_copper: bool = False,
                 rip_existing_nets: Optional[List[str]] = None,
                 force_reroute: bool = False,
@@ -810,6 +811,12 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
     if net_clearances:
         config.net_clearances = {nid: c for nid, c in net_clearances.items()
                                  if c and c > 0}
+
+    # #541: safety-floor nets the rescue ladder must not neck down.
+    if no_neck_nets:
+        config.no_neck_nets = set(no_neck_nets)
+        print(f"Safety-floor clearance on {len(config.no_neck_nets)} net(s): rescue will not "
+              f"neck them below their class (#541).")
 
     # #435 companion: per-net netclass track widths (auto-read above when
     # --track-width was omitted). get_net_track_width() routes each net at its own
@@ -2879,6 +2886,13 @@ For differential pair routing, use route_diff.py:
     parser.add_argument("--via-drill", type=float, default=None,
                         help="Via drill size in mm. Default: the board's Default net-class "
                              f"via_drill (sibling .kicad_pro), else {defaults.VIA_DRILL}.")
+    parser.add_argument("--no-neck-nets", nargs="+", metavar="NET", default=None,
+                        help="Nets whose clearance is a SAFETY floor (creepage on an HV net, "
+                             "say) rather than a routing preference. The rescue ladder will not "
+                             "neck these below their class: they route at nominal or come back "
+                             "UNROUTED, which is the honest signal that the placement must "
+                             "change. Without this, rescue completes them at reduced spacing and "
+                             "the DRC flag arrives after the fact. (#541)")
     parser.add_argument("--net-clearances", metavar="JSON", default=None,
                         help="Explicit override for the cross-class clearance map: a JSON object "
                              "mapping net name -> that net's net-class clearance in mm. When OMITTED, "
@@ -3279,6 +3293,22 @@ For differential pair routing, use route_diff.py:
     # was OMITTED the classes are honored in full (each net routes at its own class),
     # and the writeback preserves them. --net-clearances <json> overrides with
     # explicit per-net values, used as-is.
+    # #541: resolve the safety-floor net names to ids against this board.
+    # Fnmatch so a caller can name a whole class ("HV_*") without enumerating.
+    _no_neck_ids = set()
+    if getattr(args, 'no_neck_nets', None):
+        import fnmatch as _fn
+        for _nid, _net in pcb_data.nets.items():
+            if any(_fn.fnmatch(_net.name, _p) for _p in args.no_neck_nets):
+                _no_neck_ids.add(_nid)
+        _missing = [_p for _p in args.no_neck_nets
+                    if not any(_fn.fnmatch(n.name, _p) for n in pcb_data.nets.values())]
+        if _missing:
+            # Loud, because a typo here silently removes the protection the
+            # caller asked for and the board still routes.
+            print(f"WARNING: --no-neck-nets pattern(s) matched no net: {', '.join(_missing)}")
+        print(f"Safety-floor nets (#541): {len(_no_neck_ids)} matched")
+
     _net_clearances_map = None
     if args.net_clearances:
         with open(args.net_clearances, encoding="utf-8") as _f:
@@ -3326,6 +3356,7 @@ For differential pair routing, use route_diff.py:
                 neckdown_taper_length=args.neckdown_taper_length,
                 clearance=args.clearance,
                 net_clearances=_net_clearances_map,
+                no_neck_nets=_no_neck_ids,
                 keep_input_copper=args.keep_input_copper,
                 via_size=args.via_size,
                 via_drill=args.via_drill,

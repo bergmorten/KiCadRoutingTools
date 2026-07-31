@@ -167,6 +167,16 @@ def _rescue_rungs(config, fine_grid, pcb_data, net_id):
         rungs.append(replace(config, grid_step=fine_grid,
                              max_iterations=max_iters))
 
+    # #541: a net whose clearance is a SAFETY floor gets the finer grid and
+    # nothing else. The neck-down and via-shrink rungs below all trade spacing
+    # for completion, which is the right trade for a signal net and the wrong
+    # one for creepage on a high-voltage net -- there the clearance IS the
+    # requirement, and a necked route is unusable rather than merely worse.
+    # Returning an empty/nominal-only ladder means such a net comes back
+    # UNROUTED, which is the honest signal: the placement has to change.
+    if net_id in getattr(config, 'no_neck_nets', ()):  # getattr: older callers
+        return rungs
+
     fab_clear, fab_track = fab_floor_clearance_track(pcb_data)
     nominal_w = config.get_net_track_width(net_id, config.layers[0])
     rescue_track = min(nominal_w, fab_track)  # never widen a sub-floor choice
