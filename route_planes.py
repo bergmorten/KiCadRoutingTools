@@ -10,6 +10,7 @@ Usage:
 from __future__ import annotations
 
 import env_knobs
+import json
 import re
 import sys
 import os
@@ -4550,6 +4551,11 @@ Examples:
     parser.add_argument("--via-size", type=float, default=None, help="Via outer diameter in mm (default: the board Default net-class via, else 0.5)")
     parser.add_argument("--via-drill", type=float, default=None, help="Via drill size in mm (default: the board Default net-class via drill, else 0.3)")
     parser.add_argument("--track-width", type=float, default=None, help="Track width for via-to-pad connections in mm (default: the board Default net-class width, else 0.3)")
+    parser.add_argument("--net-clearances", metavar="JSON", default=None,
+                        help="Per-net clearance map {net name: mm}, as route.py takes. Used when "
+                             "placing stitching vias so a GND via clears a stricter class by ITS "
+                             "clearance, not the global one — without it a 0.35mm HV_DRIVE pad got "
+                             "a GND via at 0.325mm on a board the router had left clean. (#542)")
     parser.add_argument("--clearance", type=float, default=None, help="Copper clearance CEILING in mm. When given, every net class (Default included) is capped at min(class, this) and the writeback clamps. When OMITTED, each net routes at its own net-class clearance (base = the board's Default class, else 0.25).")
 
     # Zone options
@@ -4891,8 +4897,39 @@ Examples:
         install_layer_clearances(gnd_config, None, None, pcb_data)  # #498
         coord = GridCoord(gnd_config.grid_step)
 
+        # #542: stitching vias must clear each obstacle by that obstacle's OWN
+        # class clearance, not the global one. Without this the obstacle map
+        # prices every pad and track at config.clearance, and a GND via lands
+        # 0.325mm from a 0.35mm HV_DRIVE pad on a board the router had just
+        # left clean — the violation appears AFTER routing, so it is invisible
+        # to anyone who checks DRC at the routing stage.
+        #
+        # Explicit --net-clearances wins; otherwise auto-read the board's own
+        # netclasses, exactly as the routing stages do.
+        _gnd_ncl = None
+        try:
+            if getattr(args, 'net_clearances', None):
+                with open(args.net_clearances, encoding='utf-8') as _f:
+                    _name_to_clr = json.load(_f)
+                _gnd_ncl = {nid: float(_name_to_clr[n.name])
+                            for nid, n in pcb_data.nets.items() if n.name in _name_to_clr}
+            else:
+                from list_nets import net_clearance_map_by_id
+                _gnd_ncl = net_clearance_map_by_id(
+                    args.input_file, {nid: n.name for nid, n in pcb_data.nets.items()})
+        except Exception as _e:
+            print(f"  GND vias: could not resolve per-net clearances ({_e}); "
+                  f"using the uniform {gnd_config.clearance}mm")
+            _gnd_ncl = None
+        if _gnd_ncl:
+            gnd_config.net_clearances = dict(_gnd_ncl)
+            _strict = sum(1 for v in _gnd_ncl.values() if v > gnd_config.clearance)
+            print(f"  GND vias: per-net clearances for {len(_gnd_ncl)} net(s), "
+                  f"{_strict} stricter than the {gnd_config.clearance}mm global (#542)")
+
         # Build obstacle map
-        obstacles = build_base_obstacle_map(pcb_data, gnd_config, [])
+        obstacles = build_base_obstacle_map(pcb_data, gnd_config, [],
+                                            net_clearances=_gnd_ncl)
 
         # Add GND vias
         gnd_vias = add_gnd_vias_to_existing_board(
