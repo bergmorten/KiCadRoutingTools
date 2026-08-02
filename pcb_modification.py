@@ -2070,11 +2070,44 @@ def neck_wide_segments_grazing_pads(results, pcb_data, config) -> int:
         if not nc:
             return config.clearance
         return max(config.clearance, nc.get(nid, config.clearance))
+    # AQM-1K: safety-floor nets (#541) are exempt. --no-neck-nets previously
+    # governed only the rescue ladder (net_rescue.py), so a net the operator had
+    # explicitly forbidden necking was still necked here. On an HV board that is
+    # the difference between a 0.5 mm conductor and a 0.1 mm one.
+    no_neck = getattr(config, 'no_neck_nets', ()) or ()
+
+    def _edge_to_centreline(pad, seg):
+        """Distance from the pad's REAL copper edge to the segment centreline.
+
+        Was `_pt_seg_dist(pad_centre, seg) - max(size_x, size_y)/2` -- a bounding
+        CIRCLE. The old comment called that "conservative: never misses a
+        violation", which is true and is exactly the problem: never missing a
+        violation means INVENTING them, and each invented one silently necks a
+        legitimate wide trace. For a 9.4 x 10.8 mm FET tab (Q202.2 on the AQM-1K
+        wet end) the circle has a 5.4 mm radius where the real rectangular edge
+        is 0.70 mm away -- so 12 HV segments with 0.70-1.40 mm of legal room were
+        necked from a declared 0.5 mm back to the 0.1 mm default, on a 48.6 V
+        drive net, with no diagnostic.
+
+        Uses the same geometry as check_drc's pad checks so this pass and the DRC
+        that grades it agree.
+        """
+        from check_drc import point_to_pad_distance, _pad_perimeter_points
+        # A segment endpoint inside the pad copper == overlap, distance 0.
+        if (point_to_pad_distance(seg.start_x, seg.start_y, pad) <= 0.0
+                or point_to_pad_distance(seg.end_x, seg.end_y, pad) <= 0.0):
+            return 0.0
+        return min(_pt_seg_dist(px, py, seg.start_x, seg.start_y,
+                                seg.end_x, seg.end_y)
+                   for px, py in _pad_perimeter_points(pad))
+
     necked = 0
     for r in results:
         for seg in r.get('new_segments', []):
             default_w = config.get_track_width(seg.layer)
             if seg.width <= default_w + 1e-9:
+                continue
+            if seg.net_id in no_neck:
                 continue
             own = _own(seg.net_id)
             for pad in pads_by_layer.get(seg.layer, []):
@@ -2084,10 +2117,16 @@ def neck_wide_segments_grazing_pads(results, pcb_data, config) -> int:
                           getattr(pad, 'local_clearance', 0.0) or 0.0)
                 d = _pt_seg_dist(pad.global_x, pad.global_y,
                                  seg.start_x, seg.start_y, seg.end_x, seg.end_y)
-                # Bounding-circle pad half (conservative: never misses a violation).
+                # Cheap conservative REJECT: the bounding circle can only
+                # over-state the copper, so if even it clears, the exact shape
+                # clears. Keeps the O(pads x segs) scan fast; the exact test
+                # below runs only for the few candidates it cannot dismiss.
                 pad_half = max(pad.size_x, pad.size_y) / 2.0
-                if (d - pad_half - seg.width / 2.0 < clr
-                        and d - pad_half - default_w / 2.0 >= clr):
+                if d - pad_half - seg.width / 2.0 >= clr:
+                    continue
+                edge = _edge_to_centreline(pad, seg)
+                if (edge - seg.width / 2.0 < clr
+                        and edge - default_w / 2.0 >= clr):
                     seg.width = default_w
                     necked += 1
                     break
