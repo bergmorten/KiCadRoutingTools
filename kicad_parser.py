@@ -2089,8 +2089,20 @@ def extract_nets(content: str, kicad_version: int = 0) -> Tuple[Dict[int, Net], 
     nets = {}
     name_to_id: Dict[str, int] = {}
 
-    if kicad_version >= KICAD_10_MIN_VERSION:
-        # KiCad 10 removes the top-level net table entirely.
+    # AQM-1K: the version stamp alone does NOT tell which net encoding a file
+    # uses. KiCad 10.0.x pcbnew still writes the KiCad-9 numeric top-level table
+    # (verified: 10.0.3 demo CM5_MINIMA_3.kicad_pcb, (version 20250513), 221
+    # `(net <id> "name")` entries, zero `(net "name")` refs), and so does kad's
+    # emitter ((version 20260206)). Keying on the version alone returned ZERO
+    # nets for both, which silently disabled every consumer of pcb_data.nets:
+    # per-net netclass clearances (#439), per-net netclass track widths (#435),
+    # --no-neck-nets (#541) and --net-clearances. Symptom: an HV board with a
+    # 0.35 mm HV_DRIVE class routed at the 0.1 mm Default floor, reported
+    # honestly as min_clearance_used: 0.1, DRC-failing after the fact.
+    # Decide on the CONTENT: use the numeric table whenever the file has one.
+    _has_numeric_table = re.search(r'\(net\s+\d+\s+"', content) is not None
+    if kicad_version >= KICAD_10_MIN_VERSION and not _has_numeric_table:
+        # KiCad 10 files that omit the top-level net table.
         # Discover all net names from their usage in pads, segments, vias, and zones.
         # Match (net "name") anywhere in the file — deduplicate to build the net list.
         net_pattern = r'\(net\s+"([^"]*)"\)'
@@ -2108,7 +2120,7 @@ def extract_nets(content: str, kicad_version: int = 0) -> Tuple[Dict[int, Net], 
             name_to_id[net_name] = synthetic_id
             synthetic_id += 1
     else:
-        # KiCad 9: nets are (net <id> "name")
+        # KiCad 9 AND KiCad 10.0.x: nets are (net <id> "name")
         net_pattern = r'\(net\s+(\d+)\s+"([^"]*)"\)'
         for m in re.finditer(net_pattern, content):
             net_id = int(m.group(1))
