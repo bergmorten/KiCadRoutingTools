@@ -2787,7 +2787,7 @@ def apply_meanders_to_diff_pair(
                                     for x, y, layer in new_centerline_float]
             p_float_path, n_float_path = _process_via_positions(
                 simplified_path_grid, p_float_path, n_float_path, coord, config,
-                p_sign, n_sign, spacing_mm
+                p_sign, n_sign, spacing_mm, pair_net_ids=(p_net_id, n_net_id)
             )
 
         # Recalculate extensions for source and target connectors
@@ -2835,7 +2835,8 @@ def apply_meanders_to_diff_pair(
             gnd_net_id = result.get('gnd_net_id')
             gnd_via_dirs = result.get('gnd_via_dirs', [])
             gnd_vias = _create_gnd_vias(
-                new_centerline_grid, coord, config, layer_names, spacing_mm, gnd_net_id, gnd_via_dirs
+                new_centerline_grid, coord, config, layer_names, spacing_mm,
+                gnd_net_id, gnd_via_dirs, pair_net_ids=(p_net_id, n_net_id)
             )
             new_vias.extend(gnd_vias)
 

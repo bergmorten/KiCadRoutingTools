@@ -11,7 +11,7 @@ from typing import List, Optional, Tuple, Dict
 from dataclasses import dataclass
 
 from kicad_parser import PCBData, Segment, Via
-from routing_config import GridRouteConfig
+from routing_config import GridRouteConfig, get_net_via_geometry
 from routing_utils import point_to_pad_rect_dist
 from connectivity import get_stub_segments, get_stub_direction
 from geometry_utils import (segments_intersect_2d, point_to_segment_distance_seg,
@@ -267,7 +267,7 @@ def apply_stub_layer_switch(pcb_data: PCBData, stub: StubInfo, new_layer: str,
             # nominal via can't drop here -- dense ball/pin fields).
             fit = fitting_pad_via(stub.pad_x, stub.pad_y, stub.net_id,
                                   pcb_data, config, set())
-            v_size, v_drill = fit if fit else (config.via_size, config.via_drill)
+            v_size, v_drill = fit if fit else get_net_via_geometry(config, stub.net_id)
             via = Via(
                 x=stub.pad_x,
                 y=stub.pad_y,
@@ -300,6 +300,10 @@ def _reuse_nearby_same_net_via(pcb_data, stub, new_layer, config, segment_mods,
     # Fab-tier-aware floor (the old hardcoded 0.2 ignored --fab-tier /
     # --hole-to-hole-clearance overrides).
     h2h = getattr(config, 'hole_to_hole_clearance', 0.2) or 0.2
+    # The would-be NEW pad via is this NET's (constraints contract): a larger
+    # per-net drill needs reuse at a larger distance, or the new hole ships
+    # inside the h2h floor against the existing barrel.
+    _new_drill = get_net_via_geometry(config, stub.net_id)[1]
     best = None
     for ev in pcb_data.vias:
         if ev.net_id != stub.net_id:
@@ -310,7 +314,7 @@ def _reuse_nearby_same_net_via(pcb_data, stub, new_layer, config, segment_mods,
         d = math.hypot(ev.x - stub.pad_x, ev.y - stub.pad_y)
         if d < 1e-6:
             continue  # coincident: the normal path already handles this
-        if (d < config.via_drill / 2.0 + (ev.drill or config.via_drill) / 2.0 + h2h
+        if (d < _new_drill / 2.0 + (ev.drill or config.via_drill) / 2.0 + h2h
                 and (best is None or d < best[0])):
             best = (d, ev)
     if best is None:
@@ -395,7 +399,7 @@ def apply_bare_pad_target_via(pcb_data: PCBData, net_id: int, pad_x: float, pad_
     else:
         # Size the launch via to fit (fab-ladder step-down in dense fields).
         fit = fitting_pad_via(pad_x, pad_y, net_id, pcb_data, config, set())
-        v_size, v_drill = fit if fit else (config.via_size, config.via_drill)
+        v_size, v_drill = fit if fit else get_net_via_geometry(config, net_id)
         via = Via(
             x=pad_x, y=pad_y,
             size=v_size, drill=v_drill,
@@ -862,9 +866,13 @@ def fitting_pad_via(pad_x: float, pad_y: float, net_id: int, pcb_data: PCBData,
     _bi = getattr(pcb_data, 'board_info', None)
     n_layers = len(getattr(_bi, 'copper_layers', None) or []) or 2
     ladder = fab_floor_ladder(n_layers)
-    candidates = [(config.via_size, config.via_drill)]
+    # Start from this NET's via geometry (constraints contract; the config
+    # globals when the net has no entry); the fab ladder may step BELOW the
+    # class size when the field forces it, never above.
+    _nvs, _nvd = get_net_via_geometry(config, net_id)
+    candidates = [(_nvs, _nvd)]
     candidates += [(f['via_diameter'], f['via_drill']) for f in ladder
-                   if f['via_diameter'] < config.via_size - 1e-9]
+                   if f['via_diameter'] < _nvs - 1e-9]
     for i, (v_dia, v_drill) in enumerate(candidates):
         clear, _ = via_barrel_clear_of_foreign_copper(
             pad_x, pad_y, net_id, pcb_data, config, exclude_net_ids,
@@ -875,7 +883,7 @@ def fitting_pad_via(pad_x: float, pad_y: float, net_id: int, pcb_data: PCBData,
                     warn_fab_escalation(f"layer-switch pad via (net {net_id})")
                 print(f"      layer-switch via stepped down to "
                       f"{v_dia:g}/{v_drill:g} at ({pad_x:.2f},{pad_y:.2f}) "
-                      f"(nominal {config.via_size:g} does not fit)")
+                      f"(nominal {_nvs:g} does not fit)")
             return v_dia, v_drill
     return None
 

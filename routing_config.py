@@ -280,6 +280,15 @@ class GridRouteConfig:
     # honest "unrouted" is the correct outcome -- it says the placement needs
     # to change, which is true.
     no_neck_nets: Set[int] = field(default_factory=set)
+    # Per-net via geometry (the constraints-contract channel): {net_id ->
+    # (via_size_mm, via_drill_mm)}. Populated from a --constraints document's
+    # netClasses/netOverrides; every via-creation site sizes its via through
+    # get_net_via_geometry(config, net_id) below (the created Via's net
+    # decides), falling back to the global via_size/via_drill pair. The
+    # via-in-pad / fab-floor step-down ladders START from the net's geometry
+    # and may still shrink BELOW it when geometry forces it -- never above.
+    # Empty map = exactly the historical single global pair.
+    net_via_geometry: Dict[int, Tuple[float, float]] = field(default_factory=dict)
     # Per-layer clearance from the board's .kicad_dru custom rules (#498),
     # {layer_name: mm}. REPLACEMENT semantics, mirroring KiCad's precedence
     # (custom rules outrank netclasses and the CLI ceiling, tightening OR
@@ -651,6 +660,45 @@ class GridRouteConfig:
             estimated_cost = total_weight * self.proximity_heuristic_factor
             return self.cell_cost(estimated_cost)
         return 0
+
+
+def get_net_via_geometry(config: 'GridRouteConfig', net_id) -> Tuple[float, float]:
+    """(via_size, via_drill) in mm for a via belonging to `net_id`: the
+    per-net constraints-contract geometry when the config carries one, else
+    the global (config.via_size, config.via_drill) pair. Module-level (not a
+    method) and getattr-based so configs built by older constructors / GUI
+    paths without the field resolve identically to the historical globals."""
+    geo = getattr(config, 'net_via_geometry', None)
+    if geo and net_id is not None:
+        pair = geo.get(net_id)
+        if pair:
+            return pair
+    return (config.via_size, config.via_drill)
+
+
+def max_routing_via_geometry(config: 'GridRouteConfig', net_ids) -> Tuple[float, float]:
+    """Elementwise max (via_size, via_drill) in mm over the nets being routed
+    in one pass, floored at the config globals.
+
+    For structures SHARED by every net routed in a pass (the base obstacle
+    map's via keep-outs, the board-edge/keep-out/drill via bands) per-net
+    exactness is impossible -- one map serves all of them -- so they are
+    sized from the max over the routed nets' per-net via geometry. The
+    compromise: a larger class via is never emitted into a corridor reserved
+    for the small one (no under-block -> no DRC violation), at the cost of
+    over-blocking the small-via nets near those obstacles. Mirrors the
+    effective_clearance max-over-routed-nets pattern in
+    build_base_obstacle_map. An empty per-net map (or empty net set)
+    reproduces (config.via_size, config.via_drill) exactly."""
+    vs, vd = config.via_size, config.via_drill
+    geo = getattr(config, 'net_via_geometry', None)
+    if geo:
+        for nid in net_ids:
+            pair = geo.get(nid)
+            if pair:
+                vs = max(vs, pair[0])
+                vd = max(vd, pair[1])
+    return (vs, vd)
 
 
 class GridCoord:

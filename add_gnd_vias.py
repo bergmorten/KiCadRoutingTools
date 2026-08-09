@@ -10,7 +10,7 @@ from typing import List, Dict
 
 from kicad_parser import PCBData, Via, pad_drill_capsule
 from geometry_utils import point_to_segment_distance
-from routing_config import GridRouteConfig, GridCoord
+from routing_config import GridRouteConfig, GridCoord, get_net_via_geometry
 import rust_alloc  # noqa: F401  # issue #419: set MIMALLOC_PURGE_DELAY before grid_router loads
 from grid_router import GridObstacleMap
 
@@ -119,47 +119,48 @@ def add_gnd_vias_to_existing_board(
     print(f"  min_distance (center-to-center)={min_distance:.3f}mm")
 
     new_gnd_vias = []
-    placed_gnd_positions = []
+    placed_gnd_positions = []  # ((x, y), net_id, size, drill) per batch via
 
     # Via-to-via minimum clearance (center-to-center) for batch placement: larger
-    # of copper ring (via_size + clearance) and drill hole-to-hole (via_drill +
-    # hole_to_hole_clearance), so a thin-ring via can't land inside the drill
-    # hole-to-hole minimum (issue #125).
-    via_via_min_dist = max(config.via_size + config.clearance,
-                           config.via_drill + config.hole_to_hole_clearance)
+    # of copper ring ((sizeA+sizeB)/2 + clearance) and drill hole-to-hole
+    # ((drillA+drillB)/2 + hole_to_hole_clearance), so a thin-ring via can't land
+    # inside the drill hole-to-hole minimum (issue #125). Per-candidate: the GND
+    # net's own via geometry (constraints contract) vs the OTHER via's real
+    # geometry -- a global-sized formula under-checks when the GND class is
+    # larger. Reduces exactly to the historical via_size+clearance /
+    # via_drill+h2h at uniform geometry.
+    def _via_via_min(g_vsz, g_vdr, other_size, other_drill):
+        return max((g_vsz + other_size) / 2 + config.clearance,
+                   (g_vdr + other_drill) / 2 + config.hole_to_hole_clearance)
 
-    # Grid cells to check for via clearance
-    # The obstacle map already expands tracks by track_width/2 + clearance.
-    # We only need to check cells within via_drill/2 (the actual hole), not the full
-    # via pad, since the obstacle map expansion already accounts for clearance.
-    # Ceil (not floor) the hole radius so this circular clear-check doesn't miss the
-    # outermost ring and let the GND-via hole land ~1 cell into a keep-out (#154 class).
-    # The obstacle map expands each obstacle by (its_half + clearance +
-    # TRACK_width/2) -- the body it models is a TRACK. A via's copper ring is
-    # via_size/2 wide, so scanning only the DRILL radius under-enforced by
-    # (via_size - track_width)/2 ~ 0.19mm and shipped 35-99um sub-clearance
-    # grazes against tracks and SMD pads (Andy's bitaxe DRC2.rpt: every
-    # violation was a stitching via). Scan the full ring shortfall.
-    _ring_shortfall = max(config.via_drill / 2,
-                          config.via_size / 2 - config.track_width / 2)
-    via_check_radius_grid = max(1, coord.to_grid_dist_safe(_ring_shortfall))
-
-    def is_via_position_clear(x_mm: float, y_mm: float, sig_via_x: float, sig_via_y: float) -> tuple:
-        """Check if a via can be placed at the given position.
+    def is_via_position_clear(x_mm: float, y_mm: float, sig_via_x: float,
+                              sig_via_y: float, g_vsz: float, g_vdr: float) -> tuple:
+        """Check if a GND via with geometry (g_vsz, g_vdr) can be placed here.
 
         Returns: (is_clear, reason) where reason explains why it's blocked if not clear.
 
         Note: We do NOT use obstacles.is_via_blocked() here because that blocks
         positions within via_size+clearance of ALL vias, including the signal via
-        we're placing near. Since we already enforce min_distance (which equals
-        via_size+clearance), we just need to check track clearance and manually
-        check other vias.
+        we're placing near. Since we already enforce the signal-via minimum
+        distance, we just need to check track clearance and manually check
+        other vias.
         """
         gx, gy = coord.to_grid(x_mm, y_mm)
 
+        # Grid cells to check for via clearance.
+        # The obstacle map expands each obstacle by (its_half + clearance +
+        # TRACK_width/2) -- the body it models is a TRACK. THIS via's copper
+        # ring is g_vsz/2 wide, so scanning only the DRILL radius under-enforced
+        # by (via_size - track_width)/2 ~ 0.19mm and shipped 35-99um
+        # sub-clearance grazes against tracks and SMD pads (Andy's bitaxe
+        # DRC2.rpt: every violation was a stitching via). Scan the full ring
+        # shortfall, sized from the CANDIDATE's own geometry (constraints
+        # contract), ceil'd so the circular check can't miss the outer ring
+        # (#154 class).
+        _ring_shortfall = max(g_vdr / 2, g_vsz / 2 - config.track_width / 2)
+        via_check_radius_grid = max(1, coord.to_grid_dist_safe(_ring_shortfall))
+
         # Check all layers for track clearance
-        # The obstacle map expands tracks by track_width/2 + clearance, so we only
-        # need to check cells within the via drill radius
         for layer_idx in range(len(config.layers)):
             for dx in range(-via_check_radius_grid, via_check_radius_grid + 1):
                 for dy in range(-via_check_radius_grid, via_check_radius_grid + 1):
@@ -167,13 +168,16 @@ def add_gnd_vias_to_existing_board(
                         if obstacles.is_blocked(gx + dx, gy + dy, layer_idx):
                             return (False, f"track_blocked_layer{layer_idx}_at_({dx},{dy})")
 
-        # Check via-to-via clearance for OTHER vias (skip the signal via we're targeting)
+        # Check via-to-via clearance for OTHER vias (skip the signal via we're
+        # targeting), each priced at ITS real size/drill vs the candidate's.
         for via in pcb_data.vias:
             # Skip the signal via we're placing a GND via near
             if abs(via.x - sig_via_x) < 0.01 and abs(via.y - sig_via_y) < 0.01:
                 continue
             dist = math.sqrt((x_mm - via.x)**2 + (y_mm - via.y)**2)
-            if dist < via_via_min_dist:
+            if dist < _via_via_min(g_vsz, g_vdr,
+                                   via.size or config.via_size,
+                                   via.drill or config.via_drill):
                 return (False, f"too_close_to_via({dist:.2f}mm)")
 
         # Check drill hole-to-hole clearance from through-hole pad drills (a
@@ -187,15 +191,16 @@ def add_gnd_vias_to_existing_board(
                     # radius. Round drills degenerate to the old centre distance.
                     (p1x, p1y), (p2x, p2y), prad = pad_drill_capsule(pad)
                     dist = point_to_segment_distance(x_mm, y_mm, p1x, p1y, p2x, p2y) - prad
-                    min_pad_dist = config.hole_to_hole_clearance + config.via_drill / 2
+                    min_pad_dist = config.hole_to_hole_clearance + g_vdr / 2
                     if dist < min_pad_dist:
                         return (False, f"too_close_to_th_pad({dist:.2f}mm)")
 
         # Check against GND vias we're placing in this batch. Physical spacing,
-        # so EVERY batch via counts regardless of which ground domain it serves.
-        for (px, py), _bnet in placed_gnd_positions:
+        # so EVERY batch via counts regardless of which ground domain it serves;
+        # each batch via keeps its OWN geometry (per-domain classes may differ).
+        for (px, py), _bnet, _bsz, _bdr in placed_gnd_positions:
             dist = math.sqrt((x_mm - px)**2 + (y_mm - py)**2)
-            if dist < via_via_min_dist:
+            if dist < _via_via_min(g_vsz, g_vdr, _bsz, _bdr):
                 return (False, f"too_close_to_batch_gnd_via({dist:.2f}mm)")
 
         return (True, "clear")
@@ -211,13 +216,24 @@ def add_gnd_vias_to_existing_board(
         sx, sy = sig_via.x, sig_via.y
         via_gnd_net_id = _return_net_for(sig_via)
 
+        # Constraints contract: the GND net's own via geometry (falls back to
+        # the config globals). The minimum centre distance to the SIGNAL via
+        # uses that via's REAL size/drill, not the config globals -- a
+        # global-sized formula under-checks against any larger pre-placed via.
+        g_vsz, g_vdr = get_net_via_geometry(config, via_gnd_net_id)
+        _min_dist = max((g_vsz + (sig_via.size or config.via_size)) / 2
+                        + config.clearance,
+                        (g_vdr + (sig_via.drill or config.via_drill)) / 2
+                        + config.hole_to_hole_clearance)
+
         # Check if there's already a same-domain GND via/pad within
         # gnd_via_distance. Ground copper of ANOTHER domain is not a return path
         # for this signal, so it must not satisfy the coverage test (#489 §5).
         has_nearby_gnd = False
         nearest_gnd_dist = float('inf')
         for gx, gy in (existing_by_net.get(via_gnd_net_id, [])
-                       + [p for p, n in placed_gnd_positions if n == via_gnd_net_id]):
+                       + [p for p, n, _s, _d in placed_gnd_positions
+                          if n == via_gnd_net_id]):
             dist = math.sqrt((sx - gx)**2 + (sy - gy)**2)
             nearest_gnd_dist = min(nearest_gnd_dist, dist)
             if dist <= gnd_via_distance:
@@ -232,7 +248,7 @@ def add_gnd_vias_to_existing_board(
         best_pos = None
         distance_step = config.grid_step / 2  # Finer step for better placement
 
-        distance = min_distance
+        distance = _min_dist
         while distance <= gnd_via_distance:
             # Try all angles at this distance
             for angle_deg in angles_deg:
@@ -246,7 +262,8 @@ def add_gnd_vias_to_existing_board(
                 gnd_y = round((sy + distance * math.sin(angle_rad))
                               / config.grid_step) * config.grid_step
 
-                is_clear, reason = is_via_position_clear(gnd_x, gnd_y, sx, sy)
+                is_clear, reason = is_via_position_clear(gnd_x, gnd_y, sx, sy,
+                                                         g_vsz, g_vdr)
                 if is_clear:
                     # Found a valid position at closest possible distance
                     best_pos = (gnd_x, gnd_y)
@@ -266,8 +283,8 @@ def add_gnd_vias_to_existing_board(
             gnd_via = Via(
                 x=best_pos[0],
                 y=best_pos[1],
-                size=config.via_size,
-                drill=config.via_drill,
+                size=g_vsz,
+                drill=g_vdr,
                 # Through-hole span like every other routed via (see above).
                 layers=["F.Cu", "B.Cu"],
                 # This signal's OWN ground domain (#489 §5), not one board-global net.
@@ -275,7 +292,7 @@ def add_gnd_vias_to_existing_board(
                 free=True
             )
             new_gnd_vias.append(gnd_via)
-            placed_gnd_positions.append((best_pos, via_gnd_net_id))
+            placed_gnd_positions.append((best_pos, via_gnd_net_id, g_vsz, g_vdr))
             existing_by_net.setdefault(via_gnd_net_id, []).append(best_pos)
 
     # Summary

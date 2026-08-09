@@ -11,7 +11,8 @@ import numpy as np
 from typing import List, Optional, Tuple, Dict
 
 from kicad_parser import PCBData, Segment, Via
-from routing_config import GridRouteConfig, GridCoord, DiffPairNet, REFERENCE_GRID_STEP
+from routing_config import (GridRouteConfig, GridCoord, DiffPairNet,
+                            REFERENCE_GRID_STEP, get_net_via_geometry)
 from routing_utils import segment_length, build_layer_map, pos_key
 from connectivity import (
     find_connected_groups, find_stub_free_ends, get_stub_direction, get_net_endpoints,
@@ -860,7 +861,19 @@ def _pad_edge_launch(pcb_data, net_id, cx, cy, route_x, route_y, config, tol=0.0
     return cx + dx * shift, cy + dy * shift, shift
 
 
-def _min_via_center_distance(config):
+def _pair_via_geometry(config, p_net_id, n_net_id):
+    """Elementwise max (via_size, via_drill) over the pair's two nets
+    (constraints contract); exactly (config.via_size, config.via_drill) when
+    neither net carries a per-net entry. The P and N transition vias are
+    placed symmetrically at ONE spacing, so a single pair must serve both --
+    the max is the safe compromise when P and N somehow resolve to different
+    classes (they normally share one)."""
+    p_vs, p_vd = get_net_via_geometry(config, p_net_id)
+    n_vs, n_vd = get_net_via_geometry(config, n_net_id)
+    return max(p_vs, n_vs), max(p_vd, n_vd)
+
+
+def _min_via_center_distance(config, via_size=None, via_drill=None):
     """Minimum centre-to-centre distance between two via drills (#491).
 
     Two INDEPENDENT rules bind here and the code used only the first:
@@ -871,28 +884,38 @@ def _min_via_center_distance(config):
     so a pair placed to the copper rule ships 0.088mm inside the fab's drill
     spacing -- legal copper, unmanufacturable holes. The router READ the board
     constraint correctly and then never applied it to via placement.
+
+    via_size/via_drill: the geometry of the vias being placed (per-net,
+    constraints contract); None keeps the config globals.
     """
-    return max(config.via_size + config.clearance,
-               config.via_drill
-               + (getattr(config, 'hole_to_hole_clearance', 0.0) or 0.0))
+    _vs = via_size if via_size is not None else config.via_size
+    _vd = via_drill if via_drill is not None else config.via_drill
+    return max(_vs + config.clearance,
+               _vd + (getattr(config, 'hole_to_hole_clearance', 0.0) or 0.0))
 
 
-def _pair_via_offset(config, spacing_mm):
+def _pair_via_offset(config, spacing_mm, via_size=None, via_drill=None):
     """Perpendicular offset of each P/N transition via from the centerline.
 
     Shared by the via placer and the companion-GND placer so the two cannot
     drift: the GND placer previously measured its gap from `spacing_mm`, which
     is NOT where the vias land (0.100 assumed vs 0.206 actual), and so
     under-estimated its own clearance by exactly the overlap it shipped.
+
+    via_size/via_drill: the PAIR's via geometry (see _pair_via_geometry);
+    None keeps the config globals.
     """
+    _vs = via_size if via_size is not None else config.via_size
     max_track_width = config.get_max_track_width()
     track_via_clearance = (config.clearance + max_track_width / 2
-                           + config.via_size / 2) * config.routing_clearance_margin
-    return max(spacing_mm, _min_via_center_distance(config) / 2.0,
+                           + _vs / 2) * config.routing_clearance_margin
+    return max(spacing_mm,
+               _min_via_center_distance(config, via_size, via_drill) / 2.0,
                track_via_clearance - spacing_mm)
 
 
-def _create_gnd_vias(simplified_path, coord, config, layer_names, spacing_mm, gnd_net_id, gnd_via_dirs):
+def _create_gnd_vias(simplified_path, coord, config, layer_names, spacing_mm,
+                     gnd_net_id, gnd_via_dirs, pair_net_ids=None):
     """Create GND vias at layer changes in the centerline path.
 
     Args:
@@ -903,6 +926,9 @@ def _create_gnd_vias(simplified_path, coord, config, layer_names, spacing_mm, gn
         spacing_mm: P/N offset from centerline
         gnd_net_id: Net ID for GND vias
         gnd_via_dirs: List of directions (+1=ahead, -1=behind) from Rust router
+        pair_net_ids: Optional (p_net_id, n_net_id) so the GND-to-P/N spacing
+            uses the PAIR's per-net via geometry (constraints contract); None
+            prices the P/N vias at the config globals.
 
     Returns:
         List of Via objects for GND connections
@@ -914,18 +940,30 @@ def _create_gnd_vias(simplified_path, coord, config, layer_names, spacing_mm, gn
     # Calculate GND via perpendicular offset: track edge + clearance + via radius
     # Use max track width for clearance since track width varies by layer
     max_track_width = config.get_max_track_width()
-    gnd_via_perp_mm = spacing_mm + max_track_width/2 + config.clearance + config.via_size/2
-    via_via_dist_mm = config.via_size + config.clearance
+    # Constraints contract: the GND net may carry its own via geometry, and so
+    # may the pair's nets. All formulas reduce EXACTLY to the historical
+    # config.via_size expressions when no per-net entry exists ((s+s)/2 == s).
+    _g_vsz, _g_vdr = get_net_via_geometry(config, gnd_net_id)
+    if pair_net_ids is not None:
+        _p_vsz, _p_vdr = _pair_via_geometry(config, *pair_net_ids)
+    else:
+        _p_vsz, _p_vdr = config.via_size, config.via_drill
+    gnd_via_perp_mm = spacing_mm + max_track_width/2 + config.clearance + _g_vsz/2
+    via_via_dist_mm = (_p_vsz + _g_vsz)/2 + config.clearance
     # #491: keep the companion GND via clear of the P/N vias on the DRILL rule
     # too, measured from where those vias actually land (_pair_via_offset), not
     # from spacing_mm. Scaling the offset pair preserves the placement
-    # direction the Rust router chose.
-    _need_c2c = _min_via_center_distance(config)
-    _perp_gap = gnd_via_perp_mm - _pair_via_offset(config, spacing_mm)
+    # direction the Rust router chose. Mixed geometry: copper rule averages
+    # the two via sizes, drill rule the two drills.
+    _need_c2c = max((_p_vsz + _g_vsz) / 2 + config.clearance,
+                    (_p_vdr + _g_vdr) / 2
+                    + (getattr(config, 'hole_to_hole_clearance', 0.0) or 0.0))
+    _pair_off = _pair_via_offset(config, spacing_mm, _p_vsz, _p_vdr)
+    _perp_gap = gnd_via_perp_mm - _pair_off
     _cur_c2c = math.hypot(_perp_gap, via_via_dist_mm)
     if 0.0 < _cur_c2c < _need_c2c:
         _k = _need_c2c / _cur_c2c
-        gnd_via_perp_mm = _pair_via_offset(config, spacing_mm) + _perp_gap * _k
+        gnd_via_perp_mm = _pair_off + _perp_gap * _k
         via_via_dist_mm *= _k
 
     # Track which layer change we're processing to get direction from gnd_via_dirs
@@ -981,16 +1019,16 @@ def _create_gnd_vias(simplified_path, coord, config, layer_names, spacing_mm, gn
             # Create GND vias (free=True prevents KiCad auto-assigning net)
             gnd_vias.append(Via(
                 x=gnd_p_x, y=gnd_p_y,
-                size=config.via_size,
-                drill=config.via_drill,
+                size=_g_vsz,
+                drill=_g_vdr,
                 layers=["F.Cu", "B.Cu"],  # Always through-hole
                 net_id=gnd_net_id,
                 free=True
             ))
             gnd_vias.append(Via(
                 x=gnd_n_x, y=gnd_n_y,
-                size=config.via_size,
-                drill=config.via_drill,
+                size=_g_vsz,
+                drill=_g_vdr,
                 layers=["F.Cu", "B.Cu"],  # Always through-hole
                 net_id=gnd_net_id,
                 free=True
@@ -1203,11 +1241,12 @@ def _float_path_to_geometry(float_path, net_id, original_start, original_end, si
         x2, y2, layer2 = float_path[i + 1]
 
         if layer1 != layer2:
-            # Layer change - add via
+            # Layer change - add via (per-net contract geometry, else globals)
+            _vsz, _vdr = get_net_via_geometry(config, net_id)
             vias.append(Via(
                 x=x1, y=y1,
-                size=config.via_size,
-                drill=config.via_drill,
+                size=_vsz,
+                drill=_vdr,
                 layers=["F.Cu", "B.Cu"],  # Always through-hole
                 net_id=net_id
             ))
@@ -1716,8 +1755,11 @@ def _try_route_direction(src, tgt, pcb_data, config, obstacles, base_obstacles,
     # We need to prevent centerline from returning near the via such that offset tracks would conflict
     # Use max track width for clearance since via connects layers with potentially different widths
     max_track_width = config.get_max_track_width()
-    track_via_clearance = (config.clearance + max_track_width / 2 + config.via_size / 2) * config.routing_clearance_margin
-    min_via_spacing = config.via_size + config.clearance  # Minimum via center-to-center distance
+    # The pair's OWN via geometry (constraints contract): the P/N transition
+    # vias this route drops are the pair nets', not the config globals'.
+    _pair_vsz, _pair_vdr = _pair_via_geometry(config, p_net_id, n_net_id)
+    track_via_clearance = (config.clearance + max_track_width / 2 + _pair_vsz / 2) * config.routing_clearance_margin
+    min_via_spacing = _pair_vsz + config.clearance  # Minimum via center-to-center distance
     min_via_spacing_for_track = track_via_clearance - spacing_mm
     via_spacing = max(spacing_mm, min_via_spacing / 2, min_via_spacing_for_track)
     # Exclusion calculation: if centerline is at position X, the N track is at X + spacing_mm
@@ -1950,8 +1992,16 @@ def _try_route_direction(src, tgt, pcb_data, config, obstacles, base_obstacles,
     gnd_via_perp_grid = 0
     gnd_via_along_grid = 0
     if config.gnd_via_enabled:
-        gnd_via_perp_mm = spacing_mm + max_track_width/2 + config.clearance + config.via_size/2
-        via_via_dist_mm = config.via_size + config.clearance
+        # Reserve the corridor from the SAME per-net geometry the creation
+        # uses (_create_gnd_vias): the GND net's own via size for the
+        # perpendicular offset, and the mixed GND/pair rule for the
+        # along-track distance -- a corridor reserved for a global-sized via
+        # under-reserves for a larger GND class (finding: creation/reservation
+        # mismatch). Same GND resolution as route_diff_pair (#489 §5).
+        _gnd_nid, _ = resolve_return_net_id(pcb_data, p_net_id)
+        _g_vsz, _ = get_net_via_geometry(config, _gnd_nid)
+        gnd_via_perp_mm = spacing_mm + max_track_width/2 + config.clearance + _g_vsz/2
+        via_via_dist_mm = (_pair_vsz + _g_vsz)/2 + config.clearance
         gnd_via_perp_grid = coord.to_grid_dist(gnd_via_perp_mm)
         gnd_via_along_grid = coord.to_grid_dist(via_via_dist_mm)
 
@@ -2559,7 +2609,10 @@ def _route_direct_coupled_middle(pcb_data, diff_pair, config, obstacles, layer_n
     if any(c != 1000 for c in _lc):
         pose_kwargs['layer_costs'] = _lc
     pr = PoseRouter(**pose_kwargs)
-    via_spacing_grid = max(1, int(max(spacing_mm, (config.via_size + config.clearance) / 2)
+    # The coupled middle's P/N vias carry the PAIR's per-net geometry
+    # (constraints contract); globals when the pair has no entries.
+    _cm_vsz, _ = _pair_via_geometry(config, p_net_id, n_net_id)
+    via_spacing_grid = max(1, int(max(spacing_mm, (_cm_vsz + config.clearance) / 2)
                                   / config.grid_step + 0.5))
     max_iters = config.max_iterations * 8
 
@@ -2842,7 +2895,9 @@ def _route_direct_coupled_middle(pcb_data, diff_pair, config, obstacles, layer_n
             # shared off_plus/off_minus (else the second polarity sees corrupted input).
             p_float = list(off_plus if ps == 1 else off_minus)
             n_float = list(off_minus if ps == 1 else off_plus)
-            p_float, n_float = _process_via_positions(simplified, p_float, n_float, coord, config, ps, ns, spacing_mm)
+            p_float, n_float = _process_via_positions(
+                simplified, p_float, n_float, coord, config, ps, ns, spacing_mm,
+                pair_net_ids=(p_net_id, n_net_id))
             p_segs, p_vias, _ = _float_path_to_geometry(
                 p_float, p_net_id, None, None, ps, (0, 0), (0, 0), 0, 0, config, layer_names, omit_connectors=True,
                 pcb_data=pcb_data)
@@ -4331,7 +4386,7 @@ def route_diff_pair_with_obstacles(pcb_data: PCBData, diff_pair: DiffPairNet,
     # Process via positions
     p_float_path, n_float_path = _process_via_positions(
         simplified_path, p_float_path, n_float_path, coord, config,
-        p_sign, n_sign, spacing_mm
+        p_sign, n_sign, spacing_mm, pair_net_ids=(p_net_id, n_net_id)
     )
 
     # Convert floating-point paths to segments and vias
@@ -4401,7 +4456,8 @@ def route_diff_pair_with_obstacles(pcb_data: PCBData, diff_pair: DiffPairNet,
 
     # Create GND vias at layer changes if enabled
     gnd_vias = _create_gnd_vias(
-        simplified_path, coord, config, layer_names, spacing_mm, gnd_net_id, gnd_via_dirs
+        simplified_path, coord, config, layer_names, spacing_mm, gnd_net_id,
+        gnd_via_dirs, pair_net_ids=(p_net_id, n_net_id)
     )
     new_vias.extend(gnd_vias)
 
@@ -4634,18 +4690,25 @@ def route_diff_pair_with_obstacles(pcb_data: PCBData, diff_pair: DiffPairNet,
 
 
 def _process_via_positions(simplified_path, p_float_path, n_float_path, coord, config,
-                           p_sign, n_sign, spacing_mm):
+                           p_sign, n_sign, spacing_mm, pair_net_ids=None):
     """
     Process via positions at layer changes to be perpendicular to centerline direction.
 
     Adds approach and exit tracks to keep main P/N tracks parallel while routing to vias.
     Handles multiple layer changes by processing in reverse order.
+
+    pair_net_ids: optional (p_net_id, n_net_id) so the via spacing math uses
+    the PAIR's per-net via geometry (constraints contract); None = globals.
     """
+    if pair_net_ids is not None:
+        _p_vsz, _p_vdr = _pair_via_geometry(config, *pair_net_ids)
+    else:
+        _p_vsz, _p_vdr = config.via_size, config.via_drill
     # #491: the drill rule (hole-to-hole) binds independently of the copper rule.
-    min_via_spacing = _min_via_center_distance(config)
+    min_via_spacing = _min_via_center_distance(config, _p_vsz, _p_vdr)
     # Use max track width for clearance since via connects layers with potentially different widths
     max_track_width = config.get_max_track_width()
-    track_via_clearance = (config.clearance + max_track_width / 2 + config.via_size / 2) * config.routing_clearance_margin
+    track_via_clearance = (config.clearance + max_track_width / 2 + _p_vsz / 2) * config.routing_clearance_margin
 
     if not p_float_path or not n_float_path or len(simplified_path) < 2:
         return p_float_path, n_float_path
@@ -4700,7 +4763,7 @@ def _process_via_positions(simplified_path, p_float_path, n_float_path, coord, c
             perp_x, perp_y = -in_dir_y, in_dir_x
 
         # Use larger spacing for vias if needed
-        via_spacing = _pair_via_offset(config, spacing_mm)
+        via_spacing = _pair_via_offset(config, spacing_mm, _p_vsz, _p_vdr)
 
         # Calculate P and N via positions perpendicular to centerline
         p_via_x = cx + perp_x * p_sign * via_spacing

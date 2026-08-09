@@ -360,6 +360,11 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
                 pcb_data=None,
                 net_clearances: dict = None,
                 no_neck_nets: set = None,
+                # Constraints-contract per-net channels (route.py --constraints):
+                # {net_id: width_mm} resolved per-net track widths and
+                # {net_id: (via_size_mm, via_drill_mm)} per-net via geometry.
+                net_widths: dict = None,
+                net_via_geometry: dict = None,
                 keep_input_copper: bool = False,
                 rip_existing_nets: Optional[List[str]] = None,
                 force_reroute: bool = False,
@@ -844,6 +849,28 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
                     print(f"  {width}mm: {', '.join(names)}")
                 else:
                     print(f"  {width}mm: {len(names)} nets ({', '.join(names[:3])}...)")
+
+    # Constraints-contract per-net track widths. Wider-than-default nets ride
+    # the power-width channel (the same internals --power-nets/-widths fed);
+    # narrower-than-default class widths ride net_track_widths, which is
+    # EXACT -- get_net_track_width floors power_net_widths UP to track_width,
+    # so a narrow class fed there would silently widen. A manual power-width
+    # (identify_power_nets above) still wins via setdefault.
+    if net_widths:
+        for _nid, _w in net_widths.items():
+            if _w >= track_width:
+                config.power_net_widths.setdefault(_nid, _w)
+            else:
+                config.net_track_widths[_nid] = _w
+
+    # Constraints-contract per-net via geometry: every via-creation site sizes
+    # its vias through routing_config.get_net_via_geometry (the created via's
+    # net decides); the via-in-pad/fab-floor ladders start from these values.
+    if net_via_geometry:
+        config.net_via_geometry = {int(_nid): (float(_s), float(_d))
+                                   for _nid, (_s, _d) in net_via_geometry.items()}
+        print(f"Per-net via geometry for {len(config.net_via_geometry)} net(s) "
+              f"(constraints contract).")
 
     # Find net IDs and filter already-routed nets
     net_ids = resolve_net_ids(pcb_data, net_names)
@@ -2793,6 +2820,10 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(
         description="Batch PCB Router - Routes single-ended nets using Rust-accelerated A*. For differential pairs, use route_diff.py.",
+        # No prefix abbreviation: '--fab-ti advanced' must not evade the
+        # --constraints mutual-exclusion argv scan (conflicting_flag matches
+        # exact spellings only).
+        allow_abbrev=False,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Wildcard patterns supported:
@@ -2903,6 +2934,16 @@ For differential pair routing, use route_diff.py:
                              "foreign higher-clearance net (POWER_HI 0.25 while routing a Default "
                              "0.15 group) is not under-blocked (cross-class via-via/DRC). The GUI "
                              "derives the same map from the board's live net classes.")
+
+    parser.add_argument("--constraints", metavar="JSON", default=None,
+                        help="Routing-constraints contract file (version 1; the kad channel). "
+                             "A single strictly-validated JSON document carrying defaults, "
+                             "net classes (first-matching appliesTo glob wins), per-net "
+                             "overrides, fab floors, and the optional clearanceCeilingMm "
+                             "(#439 ceiling switch). Mutually exclusive with --track-width, "
+                             "--clearance, --via-size, --via-drill, --net-clearances, "
+                             "--power-nets, --power-nets-widths, --no-neck-nets, --fab-tier "
+                             "and --fab-overrides: the contract replaces them all.")
 
     # Power net routing options
     parser.add_argument("--power-nets", nargs="*", default=[],
@@ -3105,6 +3146,53 @@ For differential pair routing, use route_diff.py:
                            enforce_fab_floors, count_copper_layers_in_file)
     add_fab_tier_args(parser)
     args = parser.parse_args()
+
+    # --constraints (the kad contract, version 1): the single constraint
+    # channel. It REPLACES the geometry/class flags outright -- presence of any
+    # of them alongside it is a parser error naming the flag (detected on raw
+    # argv: several have no distinguishable given-state after argparse fills
+    # defaults, e.g. --fab-tier's 'standard').
+    _contract = None
+    if args.constraints:
+        from constraints_contract import (load_contract, ContractError,
+                                          conflicting_flag)
+        _conflict = conflicting_flag(sys.argv[1:])
+        if _conflict is None:
+            # Belt-and-braces second net over the parsed values (the parser
+            # runs with allow_abbrev=False, so the argv scan above already
+            # catches every spelling; this keeps the guard even if a future
+            # parser change re-enables abbreviation).
+            for _flag, _given in (
+                    ('--track-width', args.track_width is not None),
+                    ('--clearance', args.clearance is not None),
+                    ('--via-size', args.via_size is not None),
+                    ('--via-drill', args.via_drill is not None),
+                    ('--net-clearances', args.net_clearances is not None),
+                    ('--power-nets', bool(args.power_nets)),
+                    ('--power-nets-widths', bool(args.power_nets_widths)),
+                    ('--no-neck-nets', args.no_neck_nets is not None),
+                    ('--fab-overrides', getattr(args, 'fab_overrides', None) is not None)):
+                if _given:
+                    _conflict = _flag
+                    break
+        if _conflict:
+            parser.error(f"--constraints carries the full geometry/class model; "
+                         f"{_conflict} conflicts with it -- remove {_conflict}")
+        try:
+            _contract = load_contract(args.constraints)
+        except ContractError as e:
+            print(f"constraints contract error: {e}")
+            sys.exit(2)
+        # The contract's defaults play the role the explicit flags played;
+        # per-net resolution happens after the board parse below.
+        args.track_width = _contract.defaults.track_width_mm
+        args.via_size = _contract.defaults.via_size_mm
+        args.via_drill = _contract.defaults.via_drill_mm
+        print(f"Constraints contract {args.constraints}: defaults "
+              f"tw={args.track_width} clr={_contract.defaults.clearance_mm} "
+              f"via={args.via_size}/{args.via_drill}, "
+              f"{len(_contract.net_classes)} class(es), "
+              f"{len(_contract.net_overrides)} override(s)")
     # #439: the PRESENCE of --clearance is the clamp switch. Given -> it is the
     # ceiling: non-Default classes are capped at min(class, --clearance) and the
     # output .kicad_pro clamps them to the routed floor. Omitted -> honor the
@@ -3138,20 +3226,29 @@ For differential pair routing, use route_diff.py:
     # (Default-class nets) is min(Default class, ceiling), and non-Default classes are
     # capped at the ceiling in the map below. Omitted -> no ceiling: every net routes
     # at its own class (base = the board's Default class).
-    _ceiling = args.clearance                       # None iff --clearance omitted
+    # Contract: clearanceCeilingMm PRESENCE is the #439 switch, exactly like
+    # --clearance presence (kad never emits it in v1 -> honor classes in full).
+    # The contract's defaults.clearanceMm takes the role the board's Default
+    # net-class clearance plays on the flag path.
+    _ceiling = (args.clearance if _contract is None
+                else _contract.clearance_ceiling_mm)
     args._clamp_netclasses = _ceiling is not None
     args._clearance_ceiling = _ceiling
     from fix_kicad_drc_settings import warn_if_missing_project_floor
     warn_if_missing_project_floor(args.input_file)  # #441: a dropped sibling .kicad_pro strands the DRC floor
-    _dflt_clr = board_default_netclass_clearance(args.input_file)
-    if _ceiling is None:
-        args.clearance = _dflt_clr if _dflt_clr is not None else defaults.CLEARANCE
-        print(f"--clearance not given; honoring net classes with base = "
-              f"{'the board Default net-class' if _dflt_clr is not None else 'the fallback'} "
-              f"clearance {args.clearance}mm.")
+    if _contract is not None:
+        _base = _contract.defaults.clearance_mm
+        args.clearance = _base if _ceiling is None else min(_base, _ceiling)
     else:
-        # min(Default class, ceiling) so Default is capped like every other class.
-        args.clearance = min(_dflt_clr, _ceiling) if _dflt_clr is not None else _ceiling
+        _dflt_clr = board_default_netclass_clearance(args.input_file)
+        if _ceiling is None:
+            args.clearance = _dflt_clr if _dflt_clr is not None else defaults.CLEARANCE
+            print(f"--clearance not given; honoring net classes with base = "
+                  f"{'the board Default net-class' if _dflt_clr is not None else 'the fallback'} "
+                  f"clearance {args.clearance}mm.")
+        else:
+            # min(Default class, ceiling) so Default is capped like every other class.
+            args.clearance = min(_dflt_clr, _ceiling) if _dflt_clr is not None else _ceiling
     if args.hole_to_hole_clearance is None:
         _h2h = board_constraint(args.input_file, 'min_hole_to_hole')
         args.hole_to_hole_clearance = _h2h if _h2h is not None else defaults.HOLE_TO_HOLE_CLEARANCE
@@ -3164,7 +3261,14 @@ For differential pair routing, use route_diff.py:
         print(f"--board-edge-clearance not given; using "
               f"{'the board min_copper_edge_clearance' if _edge is not None else 'the fallback'} "
               f"{args.board_edge_clearance}mm.")
-    set_default_fab_tier(*fab_tier_from_args(args))
+    if _contract is not None and _contract.fab_floor_overrides():
+        # Contract fabFloors take the role of --fab-overrides: a single hard
+        # rung overlaying the standard tier (escalation disabled -- the
+        # contract states the fab's exact limits). --fab-tier/--fab-overrides
+        # are excluded above, so 'standard' is the only possible base tier.
+        set_default_fab_tier('standard', _contract.fab_floor_overrides())
+    else:
+        set_default_fab_tier(*fab_tier_from_args(args))
     _pinned_floors = enforce_fab_floors(
         count_copper_layers_in_file(args.input_file),
         track_width=getattr(args, 'track_width', None),
@@ -3309,8 +3413,62 @@ For differential pair routing, use route_diff.py:
             print(f"WARNING: --no-neck-nets pattern(s) matched no net: {', '.join(_missing)}")
         print(f"Safety-floor nets (#541): {len(_no_neck_ids)} matched")
 
-    _net_clearances_map = None
-    if args.net_clearances:
+    # --constraints: resolve every net through the contract (first-matching
+    # class in array order, netOverrides win) and feed EXACTLY the internals
+    # the excluded flags fed: the clearance map (--net-clearances), per-net
+    # widths (--power-nets/--power-nets-widths -> config.power_net_widths /
+    # config.net_track_widths), the no-neck set (--no-neck-nets), and the NEW
+    # per-net via geometry channel (config.net_via_geometry).
+    _net_widths_map = None
+    _net_via_geometry_map = None
+    if _contract is not None:
+        from fab_tiers import fab_floor_min
+        from constraints_contract import validate_against_board
+        # Board-presence validation: an unresolvable netOverrides key is the
+        # typo channel -> hard error; a class matching zero nets warns loud
+        # (stderr) but routes on.
+        try:
+            _dead_classes = validate_against_board(
+                _contract, [_n.name for _n in pcb_data.nets.values() if _n.name],
+                where=args.constraints)
+        except ContractError as _ce:
+            print(f"constraints contract error: {_ce}")
+            sys.exit(2)
+        for _cn in _dead_classes:
+            print(f"WARNING: constraints class '{_cn}': appliesTo matched no "
+                  f"net on this board", file=sys.stderr)
+        _ncu = len(getattr(pcb_data.board_info, 'copper_layers', None) or []) or 4
+        _floor = fab_floor_min(_ncu)
+        _net_clearances_map = {}
+        _net_widths_map = {}
+        _net_via_geometry_map = {}
+        for _nid, _net in pcb_data.nets.items():
+            if _nid == 0 or not _net.name:
+                continue
+            _r = _contract.resolve_net(_net.name)
+            _clr = _r['clearance']
+            if args._clamp_netclasses:
+                _clr = min(_clr, args._clearance_ceiling)  # #439 ceiling caps every class
+            if abs(_clr - args.clearance) > 1e-9:
+                _net_clearances_map[_nid] = _clr
+            if _r['neck'] == 'forbid':
+                _no_neck_ids.add(_nid)
+            # Per-net values below the fab floor are pinned up, mirroring
+            # enforce_fab_floors on the globals (the fab can't make smaller).
+            _w = max(_r['track_width'], _floor['track_width'])
+            if abs(_w - args.track_width) > 1e-9:
+                _net_widths_map[_nid] = _w
+            _vs = max(_r['via_size'], _floor['via_diameter'])
+            _vd = max(_r['via_drill'], _floor['via_drill'])
+            if abs(_vs - args.via_size) > 1e-9 or abs(_vd - args.via_drill) > 1e-9:
+                _net_via_geometry_map[_nid] = (_vs, _vd)
+        _mode = (f"capped at clearanceCeilingMm {args._clearance_ceiling}"
+                 if args._clamp_netclasses else "honored in full (no ceiling)")
+        print(f"Contract resolution: {len(_net_clearances_map)} net clearance(s) "
+              f"({_mode}), {len(_net_widths_map)} width(s), "
+              f"{len(_net_via_geometry_map)} via geometry pair(s), "
+              f"{len(_no_neck_ids)} no-neck net(s).")
+    elif args.net_clearances:
         with open(args.net_clearances, encoding="utf-8") as _f:
             _name_to_clr = json.load(_f)
         _net_clearances_map = {}
@@ -3357,6 +3515,8 @@ For differential pair routing, use route_diff.py:
                 clearance=args.clearance,
                 net_clearances=_net_clearances_map,
                 no_neck_nets=_no_neck_ids,
+                net_widths=_net_widths_map,
+                net_via_geometry=_net_via_geometry_map,
                 keep_input_copper=args.keep_input_copper,
                 via_size=args.via_size,
                 via_drill=args.via_drill,

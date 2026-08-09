@@ -618,6 +618,14 @@ def manage_vias(
     Determines which vias need to be added (for routes on non-top layers)
     and which can be removed (for routes on top layer).
 
+    BGA fanout deliberately keeps the run-global (small) via geometry: escape
+    vias must fit the ball field's pad/pitch, so the constraints contract's
+    per-net via geometry channel is intentionally NOT consumed here -- a
+    larger class via cannot escape a BGA anyway, and the via-in-pad clamp
+    below already steps the global pair DOWN the fab ladder per pad. Nets
+    needing their class via geometry get it on the main routes
+    (route.py --constraints), not on the escape stubs.
+
     Args:
         routes: List of FanoutRoute objects
         pcb_data: PCB data containing existing vias

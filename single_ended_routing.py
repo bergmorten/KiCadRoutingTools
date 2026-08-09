@@ -14,7 +14,7 @@ from terminal_colors import YELLOW, GREEN, RESET
 
 from dataclasses import replace
 from kicad_parser import PCBData, Segment, Via, pad_is_plated_through
-from routing_config import GridRouteConfig, GridCoord
+from routing_config import GridRouteConfig, GridCoord, get_net_via_geometry
 from routing_utils import build_layer_map, pad_rect_halfspan
 from connectivity import (
     get_net_endpoints,
@@ -551,7 +551,9 @@ def _emit_via_size(pcb_data, gx, gy, config, net_id=None, x=None, y=None):
     sizes = getattr(pcb_data, '_unblock_via_sizes', None)
     rec = sizes.get((gx, gy)) if sizes is not None else None
     if rec is None:
-        rec = (config.via_size, config.via_drill)
+        # Constraints-contract channel: the created via's NET decides its
+        # geometry; nets without a per-net entry get the config globals.
+        rec = get_net_via_geometry(config, net_id)
     # Re-validate EVERY emitted via against current copper (#339): the #189
     # unblock retry's allowed-cell window lets A* place a via on a cell whose
     # via-blocking says no (that is the window's purpose -- reaching a boxed
@@ -787,8 +789,11 @@ def _identify_blocking_obstacles(
     layer_map = build_layer_map(config.layers)
     num_layers = len(config.layers)
     expansion_grid = max(1, coord.to_grid_dist(config.track_width + config.clearance))
+    # The via priced here is the ROUTED net's (constraints contract): its own
+    # per-net geometry when the config carries one, else the global.
+    _net_via_size, _ = get_net_via_geometry(config, current_net_id)
     via_expansion_grid = max(1, coord.to_grid_dist(
-        config.via_size / 2 + config.track_width / 2 + config.clearance))
+        _net_via_size / 2 + config.track_width / 2 + config.clearance))
 
     blocked = np.asarray(blocked_positions, dtype=np.int64) if blocked_positions \
         else np.empty((0, 3), dtype=np.int64)
@@ -926,20 +931,25 @@ def _diagnose_blocked_start(obstacles: 'GridObstacleMap', cells: List, label: st
                     print(f"{print_prefix}    Blocking obstacles: {', '.join(blocker_strs)}")
 
 
-def _via_drill_exclusion_radius(config: 'GridRouteConfig') -> int:
+def _via_drill_exclusion_radius(config: 'GridRouteConfig', net_id=None) -> int:
     """Grid-cell radius for the Rust router's same-path via-spacing guard, sized
     from the DRILL hole-to-hole minimum (same-net vias may touch copper but not
-    drills). The router's check blocks Chebyshev dist <= 2*radius (issue #230)."""
+    drills). The router's check blocks Chebyshev dist <= 2*radius (issue #230).
+    The path's vias belong to the ROUTED net, so its per-net drill (constraints
+    contract) sizes the guard; net_id=None keeps the config global."""
     if config.hole_to_hole_clearance <= 0 or config.grid_step <= 0:
         return 0
+    _, _net_drill = get_net_via_geometry(config, net_id)
     return max(1, int(math.ceil(
-        (config.via_drill + config.hole_to_hole_clearance) / config.grid_step / 2.0)))
+        (_net_drill + config.hole_to_hole_clearance) / config.grid_step / 2.0)))
 
 
-def _path_has_close_vias(path: Optional[List], config: 'GridRouteConfig') -> bool:
+def _path_has_close_vias(path: Optional[List], config: 'GridRouteConfig',
+                         net_id=None) -> bool:
     """True if the path drops two of its OWN vias closer than the drill hole-to-hole
     minimum (a same-net VIA-DRILL-HOLE the obstacle map can't prevent within one
-    A* path). A via is a layer change at a fixed (gx, gy)."""
+    A* path). A via is a layer change at a fixed (gx, gy). Both vias are the
+    ROUTED net's, so its per-net drill (constraints contract) applies."""
     if not path or config.hole_to_hole_clearance <= 0:
         return False
     via_cells = []
@@ -949,7 +959,8 @@ def _path_has_close_vias(path: Optional[List], config: 'GridRouteConfig') -> boo
             via_cells.append((path[i][0], path[i][1]))
     if len(via_cells) < 2:
         return False
-    min_cc = (config.via_drill + config.hole_to_hole_clearance) / config.grid_step
+    _, _net_drill = get_net_via_geometry(config, net_id)
+    min_cc = (_net_drill + config.hole_to_hole_clearance) / config.grid_step
     min_cc_sq = min_cc * min_cc
     seen = set()
     for gx, gy in via_cells:
@@ -986,8 +997,8 @@ def _probe_route_with_frontier(
         print_prefix, direction_labels, track_margin, pcb_data, current_net_id,
         single_direction, via_exclusion_radius=0)
     path = result[0]
-    if path is not None and _path_has_close_vias(path, config):
-        ver = _via_drill_exclusion_radius(config)
+    if path is not None and _path_has_close_vias(path, config, current_net_id):
+        ver = _via_drill_exclusion_radius(config, current_net_id)
         if ver > 0:
             retry = _probe_route_with_frontier_once(
                 router, obstacles, forward_sources, forward_targets, config,
@@ -1915,13 +1926,18 @@ def _place_shrunk_via_in_pad(pad_obj, obstacles, config, pcb_data, net_id, coord
     # active fab-tier floor ladder (nominal floor, then any escalation rung). The
     # advanced rung is the more-costly small via 'standard' escalates to (#237).
     ladder = fab_floor_ladder(ncu)
-    candidates = [(config.via_size, config.via_drill, False)]
+    # The ladder STARTS from this net's via geometry (constraints contract;
+    # falls back to the config globals) and steps DOWN through the fab-floor
+    # rungs -- a via may shrink below its class size when the pad forces it,
+    # never grow above it.
+    _nvs, _nvd = get_net_via_geometry(config, net_id)
+    candidates = [(_nvs, _nvd, False)]
     candidates += [(f['via_diameter'], f['via_drill'], i > 0)
                    for i, f in enumerate(ladder)]
     via_pairs, seen_dia, escalated_pair = [], set(), set()
     for vd, dr, is_esc in candidates:
         vd, dr = round(vd, 3), round(dr, 3)
-        if dr < vd <= config.via_size + 1e-9 and vd not in seen_dia:
+        if dr < vd <= _nvs + 1e-9 and vd not in seen_dia:
             seen_dia.add(vd)
             via_pairs.append((vd, dr))
             if is_esc:
@@ -3567,7 +3583,10 @@ def _route_multipoint_taps_impl(
     # hole-to-hole of it. Without this, a later branch dropped a via a sub-mm away
     # -- the VTT multipoint junction double-via (hole_to_hole DRC). The ring skips
     # the via's own cell so reuse stays open.
-    _vv_radius = (config.via_size + config.clearance) * coord.inv_step
+    # Same-net via ring: both vias are THIS net's, so its per-net via size
+    # (constraints contract) sizes the ring; globals otherwise.
+    _vv_radius = (get_net_via_geometry(config, net_id)[0]
+                  + config.clearance) * coord.inv_step
 
     def _register_inprogress_via(v):
         vgx, vgy = coord.to_grid(v.x, v.y)

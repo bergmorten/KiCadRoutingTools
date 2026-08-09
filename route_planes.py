@@ -511,9 +511,13 @@ def _audit_plane_via_map(obstacles, pcb_data, config, net_id,
         fresh = build_via_obstacle_map(pcb_data, config, net_id, verbose=False,
                                        same_net_pad_clearance=same_net_pad_clearance)
         for pv in session_vias:
+            # Each session via at ITS OWN recorded geometry (per-net contract
+            # classes may differ between plane nets); the passed pair is the
+            # fallback for dicts without one.
             block_via_position(fresh, pv['x'], pv['y'], coord,
-                               hole_to_hole_clearance, via_drill,
-                               via_size, config.clearance)
+                               hole_to_hole_clearance,
+                               pv.get('drill', via_drill),
+                               pv.get('size', via_size), config.clearance)
         bb = pcb_data.board_info.board_bounds
         if not bb:
             return
@@ -2512,6 +2516,7 @@ def _stitch_plane_area_vias(
     tap_vias: Optional[List[Dict]] = None,
     tap_segments: Optional[List[Dict]] = None,
     exclude_net_ids: Optional[List[int]] = None,
+    net_via_geometry: Optional[Dict[int, Tuple[float, float]]] = None,
 ) -> List[Dict]:
     """Area via stitching + board-edge via fence (#485): bond each
     multi-layer plane net's pours across layers with a periodic via lattice
@@ -2627,6 +2632,11 @@ def _stitch_plane_area_vias(
             break
         net_name = net_display[net_id]
         layers = owned_layers[net_id]
+        # Stitch/fence vias carry the plane NET's resolved via geometry
+        # (constraints contract, {net_id: (size, drill)}); the run's
+        # via_size/via_drill arguments otherwise.
+        n_via_size, n_via_drill = (net_via_geometry or {}).get(
+            net_id, (via_size, via_drill))
         if progress_callback:
             progress_callback(0, 0, f"Stitching '{net_name}' planes...")
 
@@ -2661,7 +2671,7 @@ def _stitch_plane_area_vias(
                     else defaults.PLANE_ZONE_CLEARANCE
                 mth = zone.min_thickness if zone.min_thickness is not None \
                     else defaults.PLANE_MIN_THICKNESS
-                margin_r = via_size / 2 + zc + mth
+                margin_r = n_via_size / 2 + zc + mth
                 models_by_layer.setdefault(layer, []).append(
                     (model, main, margin_r))
         if len(models_by_layer) < 2:
@@ -2806,16 +2816,16 @@ def _stitch_plane_area_vias(
                 if _exact_layers_ok(x, y) < 2:
                     continue
                 new_via_dicts.append({
-                    'x': x, 'y': y, 'size': via_size, 'drill': via_drill,
+                    'x': x, 'y': y, 'size': n_via_size, 'drill': n_via_drill,
                     'layers': ['F.Cu', 'B.Cu'], 'net_id': net_id,
                 })
-                pcb_data.vias.append(Via(x=x, y=y, size=via_size,
-                                         drill=via_drill,
+                pcb_data.vias.append(Via(x=x, y=y, size=n_via_size,
+                                         drill=n_via_drill,
                                          layers=['F.Cu', 'B.Cu'],
                                          net_id=net_id))
                 block_via_position(obstacles, x, y, coord,
-                                   hole_to_hole_clearance, via_drill,
-                                   via_size, config.clearance)
+                                   hole_to_hole_clearance, n_via_drill,
+                                   n_via_size, config.clearance)
                 bonds.append((x, y))
                 return 'placed', d0
             return 'blocked', d0
@@ -2931,6 +2941,10 @@ def create_plane(
     net_clearances: Optional[dict] = None,
     clamp_netclasses: bool = True,
     clearance_ceiling: Optional[float] = None,
+    # Constraints contract (--constraints): when given, per-net clearances are
+    # resolved from IT (the only constraint channel) instead of auto-reading
+    # the board's .kicad_pro netclasses.
+    constraints_contract=None,
     thermal_relief: bool = False,
     thermal_vias: bool = defaults.THERMAL_VIAS,
     stitch_vias: bool = False,
@@ -3197,11 +3211,53 @@ def create_plane(
     # joins and blocker reroutes must obey them like every other routed copper.
     from kicad_dru import install_layer_clearances
     install_layer_clearances(config, None, input_file, pcb_data)
+    # Constraints contract: board-presence validation (an unresolvable
+    # netOverrides key is the typo channel -> hard failure; a class matching
+    # zero nets warns loud on stderr), and the per-PLANE-net via geometry --
+    # every via this engine creates for a net (pad tap, thermal array, stitch
+    # lattice, edge fence) is sized from that NET's resolved class, pinned up
+    # to the fab floor exactly like route.py's per-net resolution. Without a
+    # contract these are the run's via_size/via_drill arguments unchanged.
+    if constraints_contract is not None:
+        from constraints_contract import validate_against_board, ContractError
+        try:
+            _dead_classes = validate_against_board(
+                constraints_contract,
+                [n.name for n in pcb_data.nets.values() if n.name])
+        except ContractError as _ce:
+            print(f"constraints contract error: {_ce}")
+            return _empty_plane_results(return_results)
+        for _cn in _dead_classes:
+            print(f"WARNING: constraints class '{_cn}': appliesTo matched no "
+                  f"net on this board", file=sys.stderr)
+    from fab_tiers import fab_floor_min as _fab_floor_min
+    _vgeo_floor = _fab_floor_min(len(_board_cu) or len(all_layers) or 4)
+
+    def _plane_net_via_geometry(_net_name: str):
+        """(via_size, via_drill) for vias CREATED for this plane net."""
+        if constraints_contract is None:
+            return via_size, via_drill
+        _r = constraints_contract.resolve_net(_net_name)
+        return (max(_r['via_size'], _vgeo_floor['via_diameter']),
+                max(_r['via_drill'], _vgeo_floor['via_drill']))
     # Cross-class clearance (#434, mirrors batch_route/repair): auto-read the
     # board's non-Default netclasses from the INPUT's sibling .kicad_pro when
     # no map was passed, so tap tracks/vias and blocker reroutes honor KiCad's
     # pairwise max(classA, classB). All-Default boards -> empty map -> inert.
-    if net_clearances is None and input_file and os.path.isfile(input_file):
+    if net_clearances is None and constraints_contract is not None:
+        # --constraints is the ONLY constraint channel: resolve per-net
+        # clearances from the contract, never from the board's netclasses.
+        net_clearances = {}
+        for nid, n in pcb_data.nets.items():
+            if nid == 0 or not n.name:
+                continue
+            _c = constraints_contract.resolve_net(n.name)['clearance']
+            if abs(_c - clearance) > 1e-9:
+                net_clearances[nid] = _c
+        if net_clearances:
+            print(f"  Contract netclass clearances for {len(net_clearances)} "
+                  f"net(s) (cross-class max(A,B) respected for plane taps).")
+    elif net_clearances is None and input_file and os.path.isfile(input_file):
         try:
             from list_nets import net_clearance_map_by_id
             net_clearances = net_clearance_map_by_id(
@@ -3276,6 +3332,15 @@ def create_plane(
         print(f"Processing net '{net_name}' on layer {plane_layer}")
         print(f"{'='*60}")
 
+        # Every via created FOR this net below (tap, via-in-pad, thermal
+        # array, rip-up retry, fine-pitch retry) carries the plane NET's
+        # resolved via geometry (constraints contract); the run arguments
+        # without one.
+        net_via_size, net_via_drill = _plane_net_via_geometry(net_name)
+        if (net_via_size, net_via_drill) != (via_size, via_drill):
+            print(f"  Contract via geometry for '{net_name}': "
+                  f"{net_via_size:g}/{net_via_drill:g}mm")
+
         # Step 5: Identify target pads for this net
         if progress_callback:
             progress_callback(0, 0, f"{net_name}: analyzing pads on {plane_layer}...")
@@ -3314,11 +3379,15 @@ def create_plane(
                 progress_callback(0, 0, f"{net_name}: building via obstacle map...")
             obstacles = build_via_obstacle_map(pcb_data, config, net_id,
                                                same_net_pad_clearance=same_net_pad_clearance)
-            # Also block positions of vias we've already placed in previous nets
+            # Also block positions of vias we've already placed in previous
+            # nets -- each at ITS OWN recorded geometry (per-net contract
+            # classes may differ between plane nets).
             for placed_via in all_new_vias:
                 block_via_position(obstacles, placed_via['x'], placed_via['y'], coord,
-                                   hole_to_hole_clearance, via_drill,
-                                   via_size, config.clearance)
+                                   hole_to_hole_clearance,
+                                   placed_via.get('drill', via_drill),
+                                   placed_via.get('size', via_size),
+                                   config.clearance)
         else:
             obstacles = None
 
@@ -3364,7 +3433,7 @@ def create_plane(
                     if _pred_main:
                         def fill_via_preference(x, y, _m=_pred_model,
                                                 _c=_pred_main,
-                                                _s=via_size / 2):
+                                                _s=net_via_size / 2):
                             return _m.query_component(x, y, size=_s) == _c
                         print(f"  Fill-aware via preference: predicted "
                               f"{plane_layer} fill modeled (main component "
@@ -3480,21 +3549,21 @@ def create_plane(
             # so a nearby via cannot satisfy a 5x5mm EP with one drill.
             if thermal_vias and is_thermal_pad(pad, pcb_data):
                 _arr = compute_thermal_via_array(
-                    pad, obstacles, coord, config, via_size, via_drill,
+                    pad, obstacles, coord, config, net_via_size, net_via_drill,
                     hole_to_hole_clearance, pcb_data)
                 _placed = 0
                 for (_ax, _ay) in _arr:
                     _agx, _agy = coord.to_grid(_ax, _ay)
                     if obstacles.is_via_blocked(_agx, _agy):
                         continue  # a just-placed array via blocks this cell
-                    new_vias.append({'x': _ax, 'y': _ay, 'size': via_size,
-                                     'drill': via_drill,
+                    new_vias.append({'x': _ax, 'y': _ay, 'size': net_via_size,
+                                     'drill': net_via_drill,
                                      'layers': ['F.Cu', 'B.Cu'], 'net_id': net_id})
                     available_vias.append((_ax, _ay))
                     via_index.add(_ax, _ay)
                     block_via_position(obstacles, _ax, _ay, coord,
-                                       hole_to_hole_clearance, via_drill,
-                                       via_size, config.clearance)
+                                       hole_to_hole_clearance, net_via_drill,
+                                       net_via_size, config.clearance)
                     _placed += 1
                 if _placed:
                     vias_placed += _placed
@@ -3507,7 +3576,7 @@ def create_plane(
             # First, check if there's already a via very close by (within ~2 via diameters)
             # This handles cases like decoupling caps where both pads are on same net
             # Check for nearby existing via before placing a new one
-            effective_close_via_radius = close_via_radius if close_via_radius is not None else via_size * 2.5
+            effective_close_via_radius = close_via_radius if close_via_radius is not None else net_via_size * 2.5
             nearby_via = via_index.find_nearest(pad.global_x, pad.global_y, effective_close_via_radius)
             if nearby_via:
                 # Via already very close - try to reuse it
@@ -3641,12 +3710,12 @@ def create_plane(
                 # the pad copper (inert without an edge rule / when it already
                 # clears). See plane_pad_tap.clamp_tap_via_to_edge.
                 via_in_pad, _ = clamp_tap_via_to_edge(
-                    via_in_pad, pad, pcb_data, config, via_size)
+                    via_in_pad, pad, pcb_data, config, net_via_size)
                 # Found position within pad - place via there (no trace needed)
                 # KiCad vias only specify start/end layers, not intermediate
                 new_vias.append({
                     'x': via_in_pad[0], 'y': via_in_pad[1],
-                    'size': via_size, 'drill': via_drill,
+                    'size': net_via_size, 'drill': net_via_drill,
                     'layers': ['F.Cu', 'B.Cu'], 'net_id': net_id
                 })
                 available_vias.append(via_in_pad)
@@ -3654,8 +3723,8 @@ def create_plane(
                 vias_placed += 1
                 # Block this via position for hole-to-hole clearance
                 block_via_position(obstacles, via_in_pad[0], via_in_pad[1], coord,
-                                   hole_to_hole_clearance, via_drill,
-                                   via_size, config.clearance)
+                                   hole_to_hole_clearance, net_via_drill,
+                                   net_via_size, config.clearance)
                 if via_in_pad == (pad.global_x, pad.global_y):
                     print(f"placed via at pad center (no trace needed)")
                 else:
@@ -3725,7 +3794,7 @@ def create_plane(
             edge_moved = False
             if via_pos:
                 via_pos, edge_moved = clamp_tap_via_to_edge(
-                    via_pos, pad, pcb_data, config, via_size)
+                    via_pos, pad, pcb_data, config, net_via_size)
 
             placement_success = False
             trace_segments = None
@@ -3766,7 +3835,7 @@ def create_plane(
                     blocked_cells=blocked_cells,
                     new_vias=new_vias,
                     hole_to_hole_clearance=hole_to_hole_clearance,
-                    via_drill=via_drill,
+                    via_drill=net_via_drill,
                     protected_net_ids=set(net_ids),  # Protect all nets being routed (don't rip power nets we're routing)
                     verbose=verbose,
                     find_via_position_fn=find_via_position,
@@ -3776,7 +3845,7 @@ def create_plane(
                     # failed rip-up restores only collision-free ripped copper.
                     plane_vias=all_new_vias + new_vias,
                     plane_segments=all_new_segments + new_segments,
-                    via_size=via_size,
+                    via_size=net_via_size,
                     clearance=clearance,
                 )
 
@@ -3835,7 +3904,7 @@ def create_plane(
                     # Add via
                     new_vias.append({
                         'x': result.via_pos[0], 'y': result.via_pos[1],
-                        'size': via_size, 'drill': via_drill,
+                        'size': net_via_size, 'drill': net_via_drill,
                         'layers': ['F.Cu', 'B.Cu'], 'net_id': net_id
                     })
                     vias_placed += 1
@@ -3845,8 +3914,8 @@ def create_plane(
                     new_segments.extend(result.segments)
                     traces_added += len(result.segments)
                     block_via_position(obstacles, result.via_pos[0], result.via_pos[1], coord,
-                                       hole_to_hole_clearance, via_drill,
-                                   via_size, config.clearance)
+                                       hole_to_hole_clearance, net_via_drill,
+                                   net_via_size, config.clearance)
                     print(f"{GREEN}placed via at ({result.via_pos[0]:.2f}, {result.via_pos[1]:.2f}) after ripping {len(result.ripped_net_ids)} nets{RESET}")
                 else:
                     failed_pads += 1
@@ -3867,7 +3936,7 @@ def create_plane(
                                      abs(via_pos[1] - pad.global_y) < 0.001)
                 new_vias.append({
                     'x': via_pos[0], 'y': via_pos[1],
-                    'size': via_size, 'drill': via_drill,
+                    'size': net_via_size, 'drill': net_via_drill,
                     'layers': ['F.Cu', 'B.Cu'], 'net_id': net_id
                 })
                 vias_placed += 1
@@ -3878,8 +3947,8 @@ def create_plane(
                     new_segments.extend(trace_segments)
                     traces_added += len(trace_segments)
                 block_via_position(obstacles, via_pos[0], via_pos[1], coord,
-                                   hole_to_hole_clearance, via_drill,
-                                   via_size, config.clearance)
+                                   hole_to_hole_clearance, net_via_drill,
+                                   net_via_size, config.clearance)
 
                 if via_at_pad_center:
                     print(f"placed via at pad center (no trace needed)")
@@ -3957,7 +4026,7 @@ def create_plane(
                 print(f"  Pad {pad.component_ref}.{pad.pad_number} (fine retry)...", end=" ", flush=True)
                 result = tap_pad_with_escalation(
                     pad, pad_layer, net_id, pcb_data, config,
-                    max_search_radius, via_size, via_drill,
+                    max_search_radius, net_via_size, net_via_drill,
                     same_net_pad_clearance=same_net_pad_clearance,
                     pending_pads=pending_pads,
                     extra_vias=new_vias,
@@ -3972,8 +4041,8 @@ def create_plane(
                         available_vias.append((result.via['x'], result.via['y']))
                         via_index.add(result.via['x'], result.via['y'])
                         block_via_position(obstacles, result.via['x'], result.via['y'],
-                                           coord, hole_to_hole_clearance, via_drill,
-                                   via_size, config.clearance)
+                                           coord, hole_to_hole_clearance, net_via_drill,
+                                   net_via_size, config.clearance)
                     else:
                         vias_reused += 1
                     if result.segments:
@@ -4003,8 +4072,8 @@ def create_plane(
             _audit_plane_via_map(obstacles, pcb_data, config, net_id,
                                  same_net_pad_clearance,
                                  all_new_vias + new_vias, coord,
-                                 hole_to_hole_clearance, via_drill, via_size,
-                                 net_name)
+                                 hole_to_hole_clearance, net_via_drill,
+                                 net_via_size, net_name)
 
         # Step 10: Generate zone for this net (if needed)
         # For multi-net layers, defer zone generation until all nets are processed
@@ -4200,7 +4269,12 @@ def create_plane(
             zone_sexprs=all_zone_sexprs,
             tap_vias=all_new_vias,
             tap_segments=all_new_segments,
-            exclude_net_ids=all_ripped_net_ids)
+            exclude_net_ids=all_ripped_net_ids,
+            # Per-plane-net via geometry (constraints contract): stitch and
+            # fence vias size from each NET's resolved class.
+            net_via_geometry={nid: _plane_net_via_geometry(nm)
+                              for nm, nid in zip(net_names, net_ids)}
+            if constraints_contract is not None else None)
         all_new_vias.extend(stitch_via_dicts)
         total_vias_placed += len(stitch_via_dicts)
 
@@ -4515,6 +4589,10 @@ def main():
     record_invocation()  # stress-test redo manifest (#132); no-op unless REDO_MANIFEST set
     parser = argparse.ArgumentParser(
         description="Create copper zones with via stitching to net pads",
+        # No prefix abbreviation: '--fab-ti advanced' must not evade the
+        # --constraints mutual-exclusion argv scan (conflicting_flag matches
+        # exact spellings only).
+        allow_abbrev=False,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -4551,6 +4629,13 @@ Examples:
     parser.add_argument("--via-size", type=float, default=None, help="Via outer diameter in mm (default: the board Default net-class via, else 0.5)")
     parser.add_argument("--via-drill", type=float, default=None, help="Via drill size in mm (default: the board Default net-class via drill, else 0.3)")
     parser.add_argument("--track-width", type=float, default=None, help="Track width for via-to-pad connections in mm (default: the board Default net-class width, else 0.3)")
+    parser.add_argument("--constraints", metavar="JSON", default=None,
+                        help="Routing-constraints contract file (version 1; the kad channel). "
+                             "Replaces --track-width/--clearance/--via-size/--via-drill/"
+                             "--net-clearances/--power-nets/--power-nets-widths/--fab-tier/"
+                             "--fab-overrides outright (giving any of them alongside is an "
+                             "error). GND stitching vias size from the GND net's resolved "
+                             "via geometry.")
     parser.add_argument("--net-clearances", metavar="JSON", default=None,
                         help="Per-net clearance map {net name: mm}, as route.py takes. Used when "
                              "placing stitching vias so a GND via clears a stricter class by ITS "
@@ -4685,6 +4770,49 @@ Examples:
                            enforce_fab_floors, count_copper_layers_in_file)
     add_fab_tier_args(parser)
     args = parser.parse_args()
+
+    # --constraints (the kad contract, version 1): same contract and same
+    # mutual-exclusion rule as route.py, over the subset of flags this CLI
+    # defines (no --no-neck-nets here).
+    _contract = None
+    if args.constraints:
+        from constraints_contract import (load_contract, ContractError,
+                                          conflicting_flag)
+        _conflict = conflicting_flag(sys.argv[1:], (
+            '--track-width', '--clearance', '--via-size', '--via-drill',
+            '--net-clearances', '--power-nets', '--power-nets-widths',
+            '--fab-tier', '--fab-overrides'))
+        if _conflict is None:
+            # Belt-and-braces second net over the parsed values (the parser
+            # runs with allow_abbrev=False, so the argv scan above already
+            # catches every spelling; --fab-tier has no detectable given-state
+            # and is covered by the argv scan alone).
+            for _flag, _given in (
+                    ('--track-width', args.track_width is not None),
+                    ('--clearance', args.clearance is not None),
+                    ('--via-size', args.via_size is not None),
+                    ('--via-drill', args.via_drill is not None),
+                    ('--net-clearances', args.net_clearances is not None),
+                    ('--power-nets', bool(args.power_nets)),
+                    ('--power-nets-widths', bool(args.power_nets_widths)),
+                    ('--fab-overrides', getattr(args, 'fab_overrides', None) is not None)):
+                if _given:
+                    _conflict = _flag
+                    break
+        if _conflict:
+            parser.error(f"--constraints carries the full geometry/class model; "
+                         f"{_conflict} conflicts with it -- remove {_conflict}")
+        try:
+            _contract = load_contract(args.constraints)
+        except ContractError as e:
+            print(f"constraints contract error: {e}")
+            sys.exit(2)
+        args.track_width = _contract.defaults.track_width_mm
+        args.via_size = _contract.defaults.via_size_mm
+        args.via_drill = _contract.defaults.via_drill_mm
+        print(f"Constraints contract {args.constraints}: defaults "
+              f"tw={args.track_width} clr={_contract.defaults.clearance_mm} "
+              f"via={args.via_size}/{args.via_drill}")
     # #439: identical net-class/clearance model to route.py. --clearance is the
     # clamp switch: GIVEN -> ceiling, every class capped at min(class, ceiling),
     # writeback clamps (_clamp_netclasses True). OMITTED -> each net routes at its
@@ -4704,19 +4832,26 @@ Examples:
             print(f"--{_pname.replace('_', '-')} not given; using "
                   f"{'the board Default net-class' if _v is not None else 'the fallback'} "
                   f"{getattr(args, _pname)}mm.")
-    _ceiling = args.clearance                       # None iff --clearance omitted
+    # Contract: clearanceCeilingMm presence is the #439 switch, exactly like
+    # --clearance presence; the contract defaults.clearanceMm is the base.
+    _ceiling = (args.clearance if _contract is None
+                else _contract.clearance_ceiling_mm)
     args._clamp_netclasses = _ceiling is not None
     args._clearance_ceiling = _ceiling
     from fix_kicad_drc_settings import warn_if_missing_project_floor
     warn_if_missing_project_floor(args.input_file)  # #441: a dropped sibling .kicad_pro strands the DRC floor
-    _dflt_clr = board_default_netclass_clearance(args.input_file)
-    if _ceiling is None:
-        args.clearance = _dflt_clr if _dflt_clr is not None else defaults.CLEARANCE
-        print(f"--clearance not given; honoring net classes with base = "
-              f"{'the board Default net-class' if _dflt_clr is not None else 'the fallback'} "
-              f"clearance {args.clearance}mm.")
+    if _contract is not None:
+        _base = _contract.defaults.clearance_mm
+        args.clearance = _base if _ceiling is None else min(_base, _ceiling)
     else:
-        args.clearance = min(_dflt_clr, _ceiling) if _dflt_clr is not None else _ceiling
+        _dflt_clr = board_default_netclass_clearance(args.input_file)
+        if _ceiling is None:
+            args.clearance = _dflt_clr if _dflt_clr is not None else defaults.CLEARANCE
+            print(f"--clearance not given; honoring net classes with base = "
+                  f"{'the board Default net-class' if _dflt_clr is not None else 'the fallback'} "
+                  f"clearance {args.clearance}mm.")
+        else:
+            args.clearance = min(_dflt_clr, _ceiling) if _dflt_clr is not None else _ceiling
     if args.hole_to_hole_clearance is None:
         _h2h = board_constraint(args.input_file, 'min_hole_to_hole')
         args.hole_to_hole_clearance = _h2h if _h2h is not None else defaults.HOLE_TO_HOLE_CLEARANCE
@@ -4731,7 +4866,12 @@ Examples:
         print(f"--board-edge-clearance not given; using "
               f"{'the board min_copper_edge_clearance' if _edge is not None else 'the fallback'} "
               f"{args.board_edge_clearance}mm.")
-    set_default_fab_tier(*fab_tier_from_args(args))
+    if _contract is not None and _contract.fab_floor_overrides():
+        # Contract fabFloors take the role of --fab-overrides (a hard rung on
+        # the standard tier; --fab-tier/--fab-overrides are excluded above).
+        set_default_fab_tier('standard', _contract.fab_floor_overrides())
+    else:
+        set_default_fab_tier(*fab_tier_from_args(args))
     _pinned_floors = enforce_fab_floors(
         count_copper_layers_in_file(args.input_file),
         track_width=getattr(args, 'track_width', None),
@@ -4855,6 +4995,7 @@ Examples:
         no_bga_zone=args.no_bga_zone,
         clamp_netclasses=args._clamp_netclasses,
         clearance_ceiling=args._clearance_ceiling,
+        constraints_contract=_contract,
     )
 
     _wrote_output = bool(args.output_file) and os.path.isfile(args.output_file) and (
@@ -4908,7 +5049,38 @@ Examples:
         # netclasses, exactly as the routing stages do.
         _gnd_ncl = None
         try:
-            if getattr(args, 'net_clearances', None):
+            if _contract is not None:
+                # Contract resolution (the only constraint channel), plus the
+                # per-net via geometry so stitching vias size from the GND
+                # net's resolved class (netOverrides win). Same semantics as
+                # route.py's resolution: the #439 ceiling caps every class
+                # clearance, and per-net via geometry below the fab floor is
+                # pinned UP (the fab can't make smaller).
+                from fab_tiers import fab_floor_min
+                _ncu = len(getattr(pcb_data.board_info, 'copper_layers',
+                                   None) or []) or 4
+                _floor = fab_floor_min(_ncu)
+                _gnd_ncl = {}
+                _gnd_geo = {}
+                for nid, n in pcb_data.nets.items():
+                    if nid == 0 or not n.name:
+                        continue
+                    _r = _contract.resolve_net(n.name)
+                    _clr = _r['clearance']
+                    if args._clamp_netclasses:
+                        _clr = min(_clr, args._clearance_ceiling)  # #439 ceiling
+                    if abs(_clr - gnd_config.clearance) > 1e-9:
+                        _gnd_ncl[nid] = _clr
+                    _vs = max(_r['via_size'], _floor['via_diameter'])
+                    _vd = max(_r['via_drill'], _floor['via_drill'])
+                    if (abs(_vs - gnd_config.via_size) > 1e-9
+                            or abs(_vd - gnd_config.via_drill) > 1e-9):
+                        _gnd_geo[nid] = (_vs, _vd)
+                if _gnd_geo:
+                    gnd_config.net_via_geometry = _gnd_geo
+                    print(f"  GND vias: per-net via geometry for {len(_gnd_geo)} "
+                          f"net(s) (constraints contract)")
+            elif getattr(args, 'net_clearances', None):
                 with open(args.net_clearances, encoding='utf-8') as _f:
                     _name_to_clr = json.load(_f)
                 _gnd_ncl = {nid: float(_name_to_clr[n.name])
