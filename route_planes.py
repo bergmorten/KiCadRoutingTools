@@ -3251,9 +3251,12 @@ def create_plane(
         for nid, n in pcb_data.nets.items():
             if nid == 0 or not n.name:
                 continue
-            _c = constraints_contract.resolve_net(n.name)['clearance']
-            if abs(_c - clearance) > 1e-9:
-                net_clearances[nid] = _c
+            # EVERY named net rides the map (same reasoning as route.py's
+            # contract resolution): obstacle pricing is max(cfg.clearance,
+            # map entry), and tap/blocker reroutes can run below-nominal
+            # clearances where an absent entry silently forfeits the net's
+            # class value.
+            net_clearances[nid] = constraints_contract.resolve_net(n.name)['clearance']
         if net_clearances:
             print(f"  Contract netclass clearances for {len(net_clearances)} "
                   f"net(s) (cross-class max(A,B) respected for plane taps).")

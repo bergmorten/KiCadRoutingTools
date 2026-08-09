@@ -3449,8 +3449,17 @@ For differential pair routing, use route_diff.py:
             _clr = _r['clearance']
             if args._clamp_netclasses:
                 _clr = min(_clr, args._clearance_ceiling)  # #439 ceiling caps every class
-            if abs(_clr - args.clearance) > 1e-9:
-                _net_clearances_map[_nid] = _clr
+            # EVERY named net rides the map — including nets whose resolved
+            # clearance equals the global. The map is not just an override
+            # channel: the obstacle builder prices a foreign net at
+            # max(cfg.clearance, ITS map entry), and the rescue ladder necks
+            # cfg.clearance below nominal. A net absent from the map loses
+            # its clearance exactly when a rescued neighbour routes past it
+            # (measured on LP50 Rev A: 117 clearance violations at
+            # 0.10-0.197 mm against 0.2 mm classes in ONE singleEnded stage,
+            # vs 8 on the same board through the legacy --net-clearances
+            # channel, whose file covers every net).
+            _net_clearances_map[_nid] = _clr
             if _r['neck'] == 'forbid':
                 _no_neck_ids.add(_nid)
             # Per-net values below the fab floor are pinned up, mirroring
