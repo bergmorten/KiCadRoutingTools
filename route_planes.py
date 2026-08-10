@@ -3279,6 +3279,19 @@ def create_plane(
                           for nid, c in net_clearances.items()}
     if net_clearances:
         config.net_clearances = dict(net_clearances)
+    # Contract v1.1 pairClearances -> config (id-resolved rules, order kept).
+    # The plane engine's own foreign-copper pricing (plane_obstacle_builder /
+    # plane_region_connector) stays at the conservative obstacle_clearance()
+    # max(classA, classB) -- a pair RELAXATION is not applied there (missed
+    # relaxations fail loud; over-applying one is a real DRC violation) -- but
+    # any single-net base map built downstream (net rescue window) and the
+    # per-route swap in routing_context read these rules from the config.
+    if constraints_contract is not None and constraints_contract.pair_clearances:
+        config.pair_clearances = constraints_contract.pair_rules_to_ids(
+            {nid: n.name for nid, n in pcb_data.nets.items()
+             if nid != 0 and n.name})
+        print(f"  Contract pair clearances: {len(config.pair_clearances)} "
+              f"rule(s) active (single-net maps and per-route pricing).")
     # Publish the SAME map to the fill model (#483 item 5): KiCad refills a
     # zone at max(zone clearance, pairwise netclass), so on honor-classes
     # chains a looser foreign class carves copper the model would otherwise

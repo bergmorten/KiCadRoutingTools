@@ -103,10 +103,26 @@ def build_base_obstacle_map(pcb_data: PCBData, config: GridRouteConfig,
     max_net_clearance = max(_routed_clearances) if _routed_clearances else config.clearance
     effective_clearance = max(config.clearance, max_net_clearance)
 
+    # Contract v1.1 pairClearances: exact per-PAIR pricing needs the ROUTED
+    # side of the pair. A SINGLE-net build (the net_rescue window path) has it,
+    # so the pair rule's mm replaces max(classA, classB) there. A multi-net
+    # build is SHARED by every routed net and keeps the conservative max()
+    # price below -- the compromise: a pair RELAXATION is not applied (a route
+    # that needed it fails loud and lands in rescue, whose single-net rebuild
+    # IS pair-aware), and a rule that TIGHTENS a pair is likewise not applied
+    # here (caught by DRC grading, which reads the same rules).
+    _routed_single = (next(iter(nets_to_route_set))
+                      if len(nets_to_route_set) == 1 else None)
+    _pair_active = bool(getattr(config, 'pair_clearances', None))
+
     def _obstacle_clearance(net_id):
         # KiCad pairwise clearance: max(routing-side floor classA, this obstacle net's own class
         # clearance classB). A net not in the map falls back to config.clearance, so an EMPTY map
         # reproduces the prior behaviour exactly (inert until a per-net clearance map is supplied).
+        if _pair_active and _routed_single is not None:
+            _mm = config.pair_clearance(_routed_single, net_id)
+            if _mm is not None:
+                return _mm
         return max(effective_clearance, net_clearances.get(net_id, config.clearance))
 
     # Constraints-contract per-net via geometry: this base map is SHARED by
@@ -1552,15 +1568,22 @@ def add_drill_hole_obstacles(obstacles: GridObstacleMap, pcb_data: PCBData,
 
 def add_net_stubs_as_obstacles(obstacles: GridObstacleMap, pcb_data: PCBData,
                                 net_id: int, config: GridRouteConfig,
-                                extra_clearance: float = 0.0):
-    """Add a net's stub segments as obstacles to the map."""
+                                extra_clearance: float = 0.0,
+                                clearance_override: float = None):
+    """Add a net's stub segments as obstacles to the map.
+
+    clearance_override: pair-aware price when the caller knows the ROUTED net
+    (contract v1.1 pairClearances -- config.pair_obstacle_clearance). None ->
+    the shared conservative obstacle_clearance() price, unchanged.
+    """
     coord = GridCoord(config.grid_step)
     layer_map = build_layer_map(config.layers)
     # Cross-class clearance (PR392): price this net's stub copper at its own KiCad
     # pairwise clearance = max(routing-side floor, its netclass). obstacle_clearance
     # is a superset of #326 B5's per-net clearance (identical when the routing-side
     # floor isn't elevated), so a foreign routed net keeps max(classA, classB).
-    obs_clearance = config.obstacle_clearance(net_id)
+    obs_clearance = (clearance_override if clearance_override is not None
+                     else config.obstacle_clearance(net_id))
 
     # Add segments - use actual segment width and the routing-side reserve width (#156)
     for seg in pcb_data.segments:
@@ -1727,14 +1750,20 @@ def _add_segment_obstacle_with_exclusion(obstacles: GridObstacleMap, seg, coord:
 
 def add_net_pads_as_obstacles(obstacles: GridObstacleMap, pcb_data: PCBData,
                                net_id: int, config: GridRouteConfig,
-                               extra_clearance: float = 0.0):
-    """Add a net's pads as obstacles to the map."""
+                               extra_clearance: float = 0.0,
+                               clearance_override: float = None):
+    """Add a net's pads as obstacles to the map.
+
+    clearance_override: pair-aware price when the caller knows the ROUTED net
+    (contract v1.1 pairClearances); None -> obstacle_clearance(), unchanged.
+    """
     coord = GridCoord(config.grid_step)
     layer_map = build_layer_map(config.layers)
 
     # Cross-class clearance (PR392): price this net's pads at its own KiCad
     # pairwise clearance so a foreign routed net keeps max(classA, classB).
-    obs_clearance = config.obstacle_clearance(net_id)
+    obs_clearance = (clearance_override if clearance_override is not None
+                     else config.obstacle_clearance(net_id))
     pads = pcb_data.pads_by_net.get(net_id, [])
     for pad in pads:
         _add_pad_obstacle(obstacles, pad, coord, layer_map, config, extra_clearance,
@@ -1767,19 +1796,24 @@ def _via_h2h_cells(via, config: GridRouteConfig, coord: GridCoord):
 def add_net_vias_as_obstacles(obstacles: GridObstacleMap, pcb_data: PCBData,
                                net_id: int, config: GridRouteConfig,
                                extra_clearance: float = 0.0,
-                               diagonal_margin: float = 0.0):
+                               diagonal_margin: float = 0.0,
+                               clearance_override: float = None):
     """Add a net's vias as obstacles to the map.
 
     Args:
         diagonal_margin: Extra margin (in grid units) for track blocking to catch diagonal
                         segments that pass between grid points. Use 0.25 for single-ended routing.
+        clearance_override: pair-aware price when the caller knows the ROUTED
+                        net (contract v1.1 pairClearances); None ->
+                        obstacle_clearance(), unchanged.
     """
     coord = GridCoord(config.grid_step)
     num_layers = len(config.layers)
 
     # Cross-class clearance (PR392): price this net's vias at its own KiCad
     # pairwise clearance so a foreign routed net/via keeps max(classA, classB).
-    obs_clearance = config.obstacle_clearance(net_id)
+    obs_clearance = (clearance_override if clearance_override is not None
+                     else config.obstacle_clearance(net_id))
 
     # Add vias - use actual via size and max track width (vias span all layers).
     # obstacle_clearance carries this net's own netclass clearance (#326 B5) plus
@@ -2740,7 +2774,19 @@ def build_base_obstacle_map_with_vis(pcb_data: PCBData, config: GridRouteConfig,
     max_net_clearance = max(_routed_clearances) if _routed_clearances else config.clearance
     effective_clearance = max(config.clearance, max_net_clearance)
 
+    # Contract v1.1 pairClearances: same policy as build_base_obstacle_map --
+    # exact per-pair pricing for a SINGLE-net build, conservative max() for
+    # the shared multi-net build (the pair relaxation is applied per route by
+    # routing_context's prepare-time swap instead).
+    _routed_single = (next(iter(nets_to_route_set))
+                      if len(nets_to_route_set) == 1 else None)
+    _pair_active = bool(getattr(config, 'pair_clearances', None))
+
     def _obstacle_clearance(net_id):
+        if _pair_active and _routed_single is not None:
+            _mm = config.pair_clearance(_routed_single, net_id)
+            if _mm is not None:
+                return _mm
         return max(effective_clearance, net_clearances.get(net_id, config.clearance))
 
     # Routing-side via geometry = max over the routed nets (constraints

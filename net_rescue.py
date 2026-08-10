@@ -285,6 +285,11 @@ def _attempt_edge(pcb_data, net_id, gap, config, net_clearances):
         rung_clearances = net_clearances
         if not at_nominal and net_clearances:
             rung_clearances = {k: v for k, v in net_clearances.items() if k != net_id}
+        # Contract v1.1 pairClearances: this is a SINGLE-net build, so
+        # build_base_obstacle_map prices each foreign net at the exact pair
+        # rule (cfg carries config.pair_clearances through replace()) --
+        # rescue is where a pair relaxation matters most, since the main
+        # loop's shared pricing may be exactly why the net landed here.
         obstacles = build_base_obstacle_map(
             window, cfg, [net_id],
             net_clearances=rung_clearances)

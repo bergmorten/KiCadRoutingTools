@@ -20,7 +20,8 @@ from obstacle_costs import (
     add_cross_layer_tracks, compute_track_proximity_for_net
 )
 from obstacle_cache import (
-    NetObstacleData, add_net_obstacles_from_cache, remove_net_obstacles_from_cache
+    NetObstacleData, add_net_obstacles_from_cache, remove_net_obstacles_from_cache,
+    precompute_net_obstacles
 )
 from connectivity import get_stub_endpoints
 from net_queries import get_chip_pad_positions
@@ -247,6 +248,48 @@ def build_diff_pair_leg_obstacles(base_obstacles, pcb_data, config, routed_net_i
     return obstacles
 
 
+def _pair_clearance_for(config, routed_net_id: int, other_net_id: int):
+    """Contract v1.1 pair price for (routed, other) when a rule matches AND it
+    actually changes the shared cache/stamper price, else None. The comparison
+    is against config.obstacle_clearance(other) -- what the shared structures
+    priced other's copper at -- so an mm equal to it is a no-op (skip the
+    swap/override) while an mm above OR below re-prices (a pair rule REPLACES
+    max(classA, classB), in either direction)."""
+    if not getattr(config, 'pair_clearances', None):
+        return None
+    mm = config.pair_clearance(routed_net_id, other_net_id)
+    if mm is None or abs(mm - config.obstacle_clearance(other_net_id)) < 1e-12:
+        return None
+    return mm
+
+
+def _pair_priced_swaps(pcb_data, config, net_id: int,
+                       net_obstacles_cache: Dict[int, NetObstacleData]):
+    """[(std_data, pair_data)] for every cached foreign net whose pair rule
+    with the ROUTED net re-prices its copper (contract v1.1 pairClearances).
+
+    std_data is the exact NetObstacleData object currently stamped in the
+    working map (captured by reference so the swap-back removes precisely what
+    the swap removed, even if the dict were later rebound); pair_data is a
+    freshly priced twin at the pair clearance. Recomputed per prepare call --
+    pair rules cover few nets in practice, and a stale-copper memo would need
+    the same invalidation discipline as the main cache for no measured need."""
+    rules = getattr(config, 'pair_clearances', None)
+    if not rules:
+        return []
+    swaps = []
+    for other_id, std_data in net_obstacles_cache.items():
+        if other_id == net_id:
+            continue
+        mm = _pair_clearance_for(config, net_id, other_id)
+        if mm is None:
+            continue
+        pair_data = precompute_net_obstacles(pcb_data, other_id, config,
+                                             clearance_override=mm)
+        swaps.append((std_data, pair_data))
+    return swaps
+
+
 def build_single_ended_obstacles(
     base_obstacles,
     pcb_data,
@@ -287,21 +330,38 @@ def build_single_ended_obstacles(
     """
     obstacles = base_obstacles.clone_fresh()
 
+    # Contract v1.1 pairClearances: this map is built FOR net_id (the routed
+    # net is known), and it is a discarded clone -- so foreign copper whose
+    # pair rule with net_id re-prices it is stamped at the pair clearance
+    # directly (no swap-back bookkeeping needed, unlike the in-place path).
+    # _pair_clearance_for returns None when no rule applies (the common case),
+    # keeping every stamp byte-identical to before.
+
     # Add previously routed nets as obstacles
     # Note: Cannot use cache for routed nets because their segments have changed
     for routed_id in routed_net_ids:
-        add_net_stubs_as_obstacles(obstacles, pcb_data, routed_id, config)
-        add_net_vias_as_obstacles(obstacles, pcb_data, routed_id, config, diagonal_margin=diagonal_margin)
-        add_net_pads_as_obstacles(obstacles, pcb_data, routed_id, config)
+        _pmm = _pair_clearance_for(config, net_id, routed_id)
+        add_net_stubs_as_obstacles(obstacles, pcb_data, routed_id, config,
+                                   clearance_override=_pmm)
+        add_net_vias_as_obstacles(obstacles, pcb_data, routed_id, config, diagonal_margin=diagonal_margin,
+                                  clearance_override=_pmm)
+        add_net_pads_as_obstacles(obstacles, pcb_data, routed_id, config,
+                                  clearance_override=_pmm)
 
     # Add GND vias as obstacles
     if gnd_net_id is not None:
-        add_net_vias_as_obstacles(obstacles, pcb_data, gnd_net_id, config, diagonal_margin=diagonal_margin)
+        add_net_vias_as_obstacles(obstacles, pcb_data, gnd_net_id, config, diagonal_margin=diagonal_margin,
+                                  clearance_override=_pair_clearance_for(config, net_id, gnd_net_id))
 
     # Add other unrouted nets as obstacles (can use cache since they haven't changed)
     other_unrouted = [nid for nid in remaining_net_ids if nid != net_id]
     for other_net_id in other_unrouted:
-        if net_obstacles_cache and other_net_id in net_obstacles_cache:
+        _pmm = _pair_clearance_for(config, net_id, other_net_id)
+        if _pmm is not None:
+            # Pair-priced twin of the cache entry (see _pair_priced_swaps).
+            add_net_obstacles_from_cache(obstacles, precompute_net_obstacles(
+                pcb_data, other_net_id, config, clearance_override=_pmm))
+        elif net_obstacles_cache and other_net_id in net_obstacles_cache:
             add_net_obstacles_from_cache(obstacles, net_obstacles_cache[other_net_id])
         else:
             add_net_stubs_as_obstacles(obstacles, pcb_data, other_net_id, config)
@@ -388,6 +448,14 @@ def build_incremental_obstacles(
     # Remove current net's obstacles so we can route through our own stubs
     if net_id in net_obstacles_cache:
         remove_net_obstacles_from_cache(obstacles, net_obstacles_cache[net_id])
+
+    # Contract v1.1 pairClearances: re-price foreign nets whose pair rule with
+    # THIS routed net applies (rule mm INSTEAD OF max(classA, classB)). The
+    # clone is discarded after the route, so no swap-back is recorded.
+    for _std, _pair in _pair_priced_swaps(pcb_data, config, net_id,
+                                          net_obstacles_cache):
+        remove_net_obstacles_from_cache(obstacles, _std)
+        add_net_obstacles_from_cache(obstacles, _pair)
 
     # Add stub proximity costs (includes chip pads as pseudo-stubs)
     stub_proximity_net_ids = [nid for nid in all_unrouted_net_ids
@@ -481,6 +549,20 @@ def prepare_obstacles_inplace(
                 working_obstacles.remove_blocked_cells_batch(_arr)
             _TIE_LIFTED[(id(working_obstacles), net_id)] = _lifted
 
+    # Contract v1.1 pairClearances: swap foreign nets whose pair rule with
+    # THIS routed net re-prices their copper -- remove the standard-priced
+    # cache stamps, add a pair-priced twin. Recorded like the tie lift above
+    # (prepare/restore are strictly paired per route on one thread; foreign
+    # caches are never rebound inside that window, and capturing the exact
+    # NetObstacleData objects keeps the remove/re-add ref-count balanced
+    # either way, #208/#309). restore_obstacles_inplace swaps back.
+    _swaps = _pair_priced_swaps(pcb_data, config, net_id, net_obstacles_cache)
+    if _swaps:
+        for _std, _pair in _swaps:
+            remove_net_obstacles_from_cache(working_obstacles, _std)
+            add_net_obstacles_from_cache(working_obstacles, _pair)
+        _PAIR_SWAPPED[(id(working_obstacles), net_id)] = _swaps
+
     # Add stub proximity costs (includes chip pads as pseudo-stubs)
     stub_proximity_net_ids = [nid for nid in all_unrouted_net_ids
                                if nid != net_id and nid not in routed_net_ids]
@@ -570,6 +652,12 @@ def prepare_obstacles_inplace(
 # that window; keying by map id keeps cloned maps independent.
 _TIE_LIFTED: Dict[tuple, list] = {}
 
+# Contract v1.1 pair-clearance swaps installed by prepare_obstacles_inplace,
+# reverted by restore_obstacles_inplace. Same keying and lifetime contract as
+# _TIE_LIFTED. Values: [(std_data, pair_data), ...] with both NetObstacleData
+# objects captured by reference so the revert is exact.
+_PAIR_SWAPPED: Dict[tuple, list] = {}
+
 
 def restore_obstacles_inplace(
     working_obstacles,
@@ -605,6 +693,16 @@ def restore_obstacles_inplace(
     if _lifted:
         for _arr in _lifted:
             working_obstacles.add_blocked_cells_batch(_arr)
+
+    # Revert the contract v1.1 pair-clearance swaps installed by prepare:
+    # remove the pair-priced twins, re-add the exact standard-priced objects
+    # that were removed (foreign caches are never rebound inside the
+    # prepare/restore window, so `working == base + sum(caches)` holds again).
+    _swaps = _PAIR_SWAPPED.pop((id(working_obstacles), net_id), None)
+    if _swaps:
+        for _std, _pair in _swaps:
+            remove_net_obstacles_from_cache(working_obstacles, _pair)
+            add_net_obstacles_from_cache(working_obstacles, _std)
 
     # Restore current net's obstacles (from cache - original stubs)
     # Note: If routing succeeded, caller should update cache first with new route data

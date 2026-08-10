@@ -15,6 +15,15 @@ module consumes) apply IDENTICAL resolution rules:
 - ``clearanceCeilingMm`` (optional top-level) reproduces route.py's
   --clearance CEILING semantics (#439): PRESENT -> every class is capped at
   min(class, ceiling); ABSENT -> classes are honored in full.
+- ``pairClearances`` (optional top-level, v1.1): symmetric per-NET-PAIR
+  clearance rules. For a pair where one net fnmatch-matches any ``a`` pattern
+  and the other any ``b`` pattern (also with a/b swapped), the required
+  clearance is ``clearanceMm`` INSTEAD OF max(classA, classB). The FIRST rule
+  in array order that matches a pair wins. Intended use is RELAXATION (e.g.
+  half-bridge nets sharing a creepage class but sitting one diode drop apart);
+  a value above the class max is NOT rejected (KiCad's .kicad_dru allows
+  either direction), but validation does require a positive finite mm and
+  non-empty pattern arrays.
 - Fab-floor step-down ladders (via-in-pad, BGA escape) may still shrink a
   via BELOW its class size when geometry forces it -- never above.
 
@@ -73,12 +82,13 @@ _FAB_FLOOR_KEY_MAP = {
 }
 
 _TOP_KEYS = ('contract', 'defaults', 'netClasses', 'netOverrides', 'fabFloors',
-             'signalLayers', 'planes', 'clearanceCeilingMm')
+             'signalLayers', 'planes', 'clearanceCeilingMm', 'pairClearances')
 _DEFAULTS_KEYS = ('trackWidthMm', 'clearanceMm', 'viaSizeMm', 'viaDrillMm')
 _CLASS_KEYS = ('name', 'appliesTo', 'trackWidthMm', 'clearanceMm',
                'viaSizeMm', 'viaDrillMm', 'neck')
 _OVERRIDE_KEYS = ('trackWidthMm', 'clearanceMm', 'viaSizeMm', 'viaDrillMm', 'neck')
 _PLANE_KEYS = ('net', 'layer')
+_PAIR_KEYS = ('a', 'b', 'clearanceMm')
 _NECK_VALUES = ('allow', 'forbid')
 
 
@@ -170,6 +180,27 @@ class NetClass:
 
 
 @dataclass(frozen=True)
+class PairRule:
+    """One ``pairClearances`` entry: a symmetric per-pair clearance override.
+
+    Matches a NET PAIR when one side fnmatch-matches any ``a`` pattern and the
+    other any ``b`` pattern -- in either assignment (symmetric). The matched
+    pair's required clearance is ``clearance_mm`` INSTEAD OF the class
+    max(classA, classB)."""
+    a: Tuple[str, ...]
+    b: Tuple[str, ...]
+    clearance_mm: float
+
+    @staticmethod
+    def _any(net_name: str, globs: Tuple[str, ...]) -> bool:
+        return any(fnmatch.fnmatchcase(net_name, g) for g in globs)
+
+    def matches(self, net_a: str, net_b: str) -> bool:
+        return ((self._any(net_a, self.a) and self._any(net_b, self.b))
+                or (self._any(net_a, self.b) and self._any(net_b, self.a)))
+
+
+@dataclass(frozen=True)
 class NetOverride:
     track_width_mm: Optional[float] = None
     clearance_mm: Optional[float] = None
@@ -187,6 +218,7 @@ class Contract:
     signal_layers: List[str] = field(default_factory=list)
     planes: List[Dict[str, str]] = field(default_factory=list)
     clearance_ceiling_mm: Optional[float] = None
+    pair_clearances: List[PairRule] = field(default_factory=list)
 
     def class_for(self, net_name: str) -> Optional[NetClass]:
         """FIRST class in array order whose appliesTo matches, else None."""
@@ -231,6 +263,31 @@ class Contract:
                 neck = ov.neck
         return {'clearance': clearance, 'track_width': track_width,
                 'via_size': via_size, 'via_drill': via_drill, 'neck': neck}
+
+    def resolve_pair(self, net_a: str, net_b: str) -> Optional[float]:
+        """Pair clearance (mm) for (net_a, net_b): the FIRST rule in
+        ``pairClearances`` array order that matches the pair (symmetric --
+        a<->b swapped also matches), else None (-> the caller's normal
+        max(classA, classB) rule applies)."""
+        for r in self.pair_clearances:
+            if r.matches(net_a, net_b):
+                return r.clearance_mm
+        return None
+
+    def pair_rules_to_ids(self, net_names_by_id) -> List[Tuple[frozenset, frozenset, float]]:
+        """Resolve the pattern rules to board net IDs, preserving array order:
+        [(a_ids, b_ids, mm), ...]. First-match-wins over these triples
+        reproduces resolve_pair() exactly (a pair matches triple k iff one id
+        is in a_ids and the other in b_ids, either way around). Consumed by
+        the router configs, which work in net ids, not names."""
+        out: List[Tuple[frozenset, frozenset, float]] = []
+        for r in self.pair_clearances:
+            a_ids = frozenset(nid for nid, name in net_names_by_id.items()
+                              if name and PairRule._any(name, r.a))
+            b_ids = frozenset(nid for nid, name in net_names_by_id.items()
+                              if name and PairRule._any(name, r.b))
+            out.append((a_ids, b_ids, r.clearance_mm))
+        return out
 
     def fab_floor_overrides(self) -> Dict[str, float]:
         """fabFloors translated to fab_tiers' --fab-overrides vocabulary
@@ -336,10 +393,28 @@ def parse_contract(doc: dict, where: str = 'contract document') -> Contract:
 
     ceiling = _mm(doc, 'clearanceCeilingMm', where)
 
+    pair_clearances: List[PairRule] = []
+    if 'pairClearances' in doc:
+        arr = doc['pairClearances']
+        if not isinstance(arr, list):
+            raise _err(where, f'"pairClearances" must be an array, got {type(arr).__name__}')
+        for i, p in enumerate(arr):
+            pw = f'{where}: pairClearances[{i}]'
+            pd = _require_dict(p, pw)
+            _reject_unknown(pd, _PAIR_KEYS, pw)
+            for k in ('a', 'b'):
+                if k not in pd:
+                    raise _err(pw, f'missing required key "{k}"')
+            pair_clearances.append(PairRule(
+                a=tuple(_str_list(pd['a'], pw, 'a', allow_empty=False)),
+                b=tuple(_str_list(pd['b'], pw, 'b', allow_empty=False)),
+                clearance_mm=_mm(pd, 'clearanceMm', pw, required=True)))
+
     contract = Contract(defaults=defaults, net_classes=net_classes,
                         net_overrides=net_overrides, fab_floors=fab_floors,
                         signal_layers=signal_layers, planes=planes,
-                        clearance_ceiling_mm=ceiling)
+                        clearance_ceiling_mm=ceiling,
+                        pair_clearances=pair_clearances)
 
     # Annular-ring validation at every RESOLVED level: the defaults pair,
     # each class AFTER inheriting the defaults (catching a class that

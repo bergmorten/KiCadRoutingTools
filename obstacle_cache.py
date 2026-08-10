@@ -257,7 +257,8 @@ class NetObstacleData:
 
 def precompute_net_obstacles(pcb_data: PCBData, net_id: int, config: GridRouteConfig,
                               extra_clearance: float = 0.0,
-                              diagonal_margin: float = defaults.DIAGONAL_MARGIN) -> NetObstacleData:
+                              diagonal_margin: float = defaults.DIAGONAL_MARGIN,
+                              clearance_override: float = None) -> NetObstacleData:
     """Pre-compute obstacle cells for a single net.
 
     Returns cached data that can be quickly added to obstacle maps via batch operations.
@@ -268,6 +269,12 @@ def precompute_net_obstacles(pcb_data: PCBData, net_id: int, config: GridRouteCo
         config: Routing configuration
         extra_clearance: Additional clearance (for diff pair routing)
         diagonal_margin: Extra margin for via blocking near diagonal segments
+        clearance_override: price net_id's copper at THIS clearance instead of
+            config.obstacle_clearance(net_id). The contract v1.1 pairClearances
+            channel: routing_context's per-route swap builds a pair-priced twin
+            of a net's cache when a pair rule (routed net, net_id) applies.
+            Per-layer .kicad_dru rules (#498) still REPLACE it on ruled layers,
+            exactly as they replace the class value.
 
     Returns:
         NetObstacleData with blocked_cells and blocked_vias lists
@@ -281,8 +288,12 @@ def precompute_net_obstacles(pcb_data: PCBData, net_id: int, config: GridRouteCo
     # own KiCad pairwise clearance = max(routing-side floor, net_id's class). A
     # single value per net keeps the per-layer precompute cheap (one lookup, no
     # per-obstacle branching). Inert (== config.clearance) when no map is set, so
-    # the whole function is byte-identical to pre-PR392 then.
-    obs_clearance = config.obstacle_clearance(net_id)
+    # the whole function is byte-identical to pre-PR392 then. NOTE the SHARED
+    # compromise: one price per net regardless of which net routes past it --
+    # pair rules are applied by the per-route swap (routing_context), which
+    # passes clearance_override.
+    obs_clearance = (clearance_override if clearance_override is not None
+                     else config.obstacle_clearance(net_id))
 
     # Collect cell arrays; deduplicated with np.unique at the end (same
     # unique-cell semantics as the per-cell sets this replaces)

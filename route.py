@@ -365,6 +365,12 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
                 # {net_id: (via_size_mm, via_drill_mm)} per-net via geometry.
                 net_widths: dict = None,
                 net_via_geometry: dict = None,
+                # Contract v1.1 pairClearances resolved to board net ids:
+                # [(a_ids, b_ids, mm), ...] in rule order (first match wins).
+                # A matched NET PAIR's clearance is mm INSTEAD OF the class
+                # max(classA, classB); applied wherever the routed net is
+                # known (per-route swap, single-net rescue maps).
+                pair_clearances: list = None,
                 keep_input_copper: bool = False,
                 rip_existing_nets: Optional[List[str]] = None,
                 force_reroute: bool = False,
@@ -816,6 +822,15 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
     if net_clearances:
         config.net_clearances = {nid: c for nid, c in net_clearances.items()
                                  if c and c > 0}
+
+    # Contract v1.1 pairClearances (id-resolved rules). Consumed by the
+    # pair-aware pricing sites only (routing_context's per-route swap, the
+    # single-net base-map builds); the shared base map / caches / in-run
+    # stampers keep the conservative max(classA, classB) price.
+    if pair_clearances:
+        config.pair_clearances = list(pair_clearances)
+        print(f"Pair clearances (constraints contract): "
+              f"{len(config.pair_clearances)} rule(s) active.")
 
     # #541: safety-floor nets the rescue ladder must not neck down.
     if no_neck_nets:
@@ -3421,6 +3436,7 @@ For differential pair routing, use route_diff.py:
     # per-net via geometry channel (config.net_via_geometry).
     _net_widths_map = None
     _net_via_geometry_map = None
+    _pair_rules_map = None
     if _contract is not None:
         from fab_tiers import fab_floor_min
         from constraints_contract import validate_against_board
@@ -3471,11 +3487,17 @@ For differential pair routing, use route_diff.py:
             _vd = max(_r['via_drill'], _floor['via_drill'])
             if abs(_vs - args.via_size) > 1e-9 or abs(_vd - args.via_drill) > 1e-9:
                 _net_via_geometry_map[_nid] = (_vs, _vd)
+        # v1.1 pairClearances: resolve the name patterns to board net ids once
+        # (rule order preserved -- first match wins downstream).
+        _pair_rules_map = _contract.pair_rules_to_ids(
+            {_nid: _net.name for _nid, _net in pcb_data.nets.items()
+             if _nid != 0 and _net.name})
         _mode = (f"capped at clearanceCeilingMm {args._clearance_ceiling}"
                  if args._clamp_netclasses else "honored in full (no ceiling)")
         print(f"Contract resolution: {len(_net_clearances_map)} net clearance(s) "
               f"({_mode}), {len(_net_widths_map)} width(s), "
               f"{len(_net_via_geometry_map)} via geometry pair(s), "
+              f"{len(_pair_rules_map)} pair clearance rule(s), "
               f"{len(_no_neck_ids)} no-neck net(s).")
     elif args.net_clearances:
         with open(args.net_clearances, encoding="utf-8") as _f:
@@ -3526,6 +3548,7 @@ For differential pair routing, use route_diff.py:
                 no_neck_nets=_no_neck_ids,
                 net_widths=_net_widths_map,
                 net_via_geometry=_net_via_geometry_map,
+                pair_clearances=_pair_rules_map,
                 keep_input_copper=args.keep_input_copper,
                 via_size=args.via_size,
                 via_drill=args.via_drill,

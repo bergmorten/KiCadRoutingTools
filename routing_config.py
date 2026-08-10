@@ -289,6 +289,20 @@ class GridRouteConfig:
     # and may still shrink BELOW it when geometry forces it -- never above.
     # Empty map = exactly the historical single global pair.
     net_via_geometry: Dict[int, Tuple[float, float]] = field(default_factory=dict)
+    # Contract v1.1 pairClearances: symmetric per-NET-PAIR clearance rules,
+    # resolved from name patterns to board net ids at run start
+    # (constraints_contract.Contract.pair_rules_to_ids). Each triple is
+    # (a_ids, b_ids, mm); a pair (x, y) matches a triple when one id is in
+    # a_ids and the other in b_ids (either way around), and the FIRST matching
+    # triple in list order wins. A matched pair's required clearance is mm
+    # INSTEAD OF max(classA, classB) -- the relaxation channel that lets e.g.
+    # half-bridge nets sharing a creepage class approach each other. Applied
+    # wherever the ROUTED net is known (per-route swap in routing_context,
+    # single-net base maps like the rescue path); shared structures built for
+    # a SET of nets cannot know the routed side and keep the conservative
+    # max() price (a missed relaxation fails loud; over-applying one is a
+    # real DRC violation).
+    pair_clearances: List[Tuple[frozenset, frozenset, float]] = field(default_factory=list)
     # Per-layer clearance from the board's .kicad_dru custom rules (#498),
     # {layer_name: mm}. REPLACEMENT semantics, mirroring KiCad's precedence
     # (custom rules outrank netclasses and the CLI ceiling, tightening OR
@@ -334,9 +348,45 @@ class GridRouteConfig:
         Consumers (base map builder + every incremental obstacle stamper) MUST
         route their foreign-copper clearance through this one method so the ADD
         and REMOVE paths derive an identical per-obstacle value (ref-count
-        symmetry, issue #208/#309)."""
+        symmetry, issue #208/#309).
+
+        Contract v1.1 pairClearances are deliberately NOT consulted here: this
+        price is baked into structures SHARED across routed nets (base map,
+        per-net caches, in-run stampers), where the routed side of the pair is
+        unknown. That is the conservative compromise -- a pair RELAXATION is
+        only applied where the routed net is in hand (pair_obstacle_clearance;
+        the per-route swap in routing_context, the single-net base map used by
+        net_rescue). A relaxation missed here is safe (routes fail loud); one
+        over-applied would be a silent DRC violation."""
         floor = self.net_clearance_floor if self.net_clearance_floor is not None else self.clearance
         return max(floor, self.net_clearances.get(net_id, self.clearance))
+
+    def pair_clearance(self, net_a: int, net_b: int) -> Optional[float]:
+        """Contract v1.1 pair rule for the NET PAIR (net_a, net_b): the FIRST
+        matching triple's mm (symmetric -- either assignment of the two ids to
+        the rule's a/b sides matches), else None (-> normal max(classA,
+        classB) pricing applies). Same-net pairs never match: a pair rule
+        governs spacing BETWEEN two nets, not a net against itself."""
+        if net_a == net_b:
+            return None
+        for a_ids, b_ids, mm in self.pair_clearances:
+            if ((net_a in a_ids and net_b in b_ids)
+                    or (net_a in b_ids and net_b in a_ids)):
+                return mm
+        return None
+
+    def pair_obstacle_clearance(self, routed_net_id: int, obstacle_net_id: int) -> float:
+        """Pair-aware price for OBSTACLE copper when the ROUTED net is known:
+        the pair rule's mm when one matches (INSTEAD OF the class max), else
+        this exact pair's max(classA, classB) -- NOT the shared routing-side
+        floor, which exists only because shared maps cannot know the routed
+        side. Only call this where a single routed net is in hand; shared
+        structures keep obstacle_clearance()."""
+        mm = self.pair_clearance(routed_net_id, obstacle_net_id)
+        if mm is not None:
+            return mm
+        return max(self.net_clearances.get(routed_net_id, self.clearance),
+                   self.net_clearances.get(obstacle_net_id, self.clearance))
 
     def set_net_clearances(self, net_clearances, routed_net_ids) -> None:
         """Install the cross-class clearance map and compute the routing-side
