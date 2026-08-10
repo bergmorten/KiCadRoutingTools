@@ -188,6 +188,28 @@ def _run_route_cmd(cmd, log_file):
         return subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT).returncode
 
 
+def plane_served_nets(route_args: str) -> set:
+    """Nets the caller told route.py NOT to track-route.
+
+    kad passes plane-served nets as '!NET' exclusion patterns (the planes
+    stage pours them; they carry no tracks by design). route.py duly skips
+    them, and its summary then lists them as failed/pad-deficit — so the
+    loop counted phantom failures, quenched parts anchoring nets that were
+    never routable, and reported "7 failures" on LP50 Rev A of which 5 were
+    plane copper doing its job. Parsed with shlex so quoting matches how the
+    args were built.
+    """
+    out = set()
+    try:
+        toks = shlex.split(route_args)
+    except ValueError:
+        return out
+    for tok in toks:
+        if tok.startswith('!') and len(tok) > 1:
+            out.add(tok[1:])
+    return out
+
+
 def run_route(pcb_file: str, routed_file: str, route_args: str, log_file: str):
     """Run route.py, return (metrics dict, log text)."""
     # Absolute path to the sibling route.py, so the loop runs from any cwd.
@@ -216,15 +238,29 @@ def run_route(pcb_file: str, routed_file: str, route_args: str, log_file: str):
         raise RuntimeError(f"route.py produced no JSON_SUMMARY (see {log_file})"
                            f"\n" + _log_tail(log))
 
+    excluded = plane_served_nets(route_args)
     failed_nets = list(summary.get('failed_single', []))
     # failed_multipoint entries are dicts {net_name, failed_pads}; keep just the
     # name so failed_nets is uniformly net-name strings (downstream uses them as
     # dict keys -> a dict here raises "unhashable type: 'dict'").
     failed_nets += [d['net_name'] if isinstance(d, dict) else d
                     for d in summary.get('failed_multipoint', [])]
+    # PLANE-SERVED NETS ARE NOT FAILURES. They were excluded from routing on
+    # purpose, so neither their names nor their unconnected pads may enter the
+    # tally the loop optimises against or the move-target set it quenches.
+    plane_failed = sorted({n for n in failed_nets if n in excluded})
+    failed_nets = [n for n in failed_nets if n not in excluded]
     mp_deficit = (summary.get('multipoint_pads_total', 0)
                   - summary.get('multipoint_pads_connected', 0))
-    failures = len(summary.get('failed_single', [])) + mp_deficit
+    plane_pads = 0
+    for d in summary.get('failed_multipoint', []):
+        if isinstance(d, dict) and d.get('net_name') in excluded:
+            plane_pads += int(d.get('failed_pads', 0) or 0)
+    mp_deficit = max(0, mp_deficit - plane_pads)
+    failures = len([n for n in summary.get('failed_single', [])
+                    if n not in excluded]) + mp_deficit
+    if plane_failed:
+        print(f"  plane-served (not counted): {', '.join(plane_failed)}")
 
     # Blocker nets from frontier diagnostics. Prefer the structured
     # JSON_SUMMARY 'blockers' key (#409): the last-wins attribution of nets

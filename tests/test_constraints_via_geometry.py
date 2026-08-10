@@ -324,3 +324,85 @@ def test_diff_pair_via_spacing_uses_pair_geometry():
 
 if __name__ == '__main__':
     sys.exit(pytest.main([__file__, '-q']))
+
+
+# A no-net SMD pad sitting in open board space. net 0 is KiCad's "no net":
+# U321 pad 15 on LP50 Rev A is exactly this, and a 0.6 mm contract-class via
+# landed 0.106 mm from it — through BOTH the 0.2 netclass clearance and the
+# 0.25 hole floor — because the pad's via keep-out was priced at the run-global
+# via size instead of the routed net's own geometry.
+NC_PAD_BOARD = """(kicad_pcb (version 20240108) (generator test)
+  (layers (0 "F.Cu" signal) (31 "B.Cu" signal) (44 "Edge.Cuts" user))
+  (net 0 "")
+  (net 1 "SIG")
+  (net 2 "GND")
+  (gr_line (start 0 0) (end 30 0) (layer "Edge.Cuts") (width 0.1))
+  (gr_line (start 30 0) (end 30 20) (layer "Edge.Cuts") (width 0.1))
+  (gr_line (start 30 20) (end 0 20) (layer "Edge.Cuts") (width 0.1))
+  (gr_line (start 0 20) (end 0 0) (layer "Edge.Cuts") (width 0.1))
+  (footprint "nc" (layer "F.Cu") (at 15 10)
+    (pad "15" smd rect (at 0 0) (size 1.0 1.0) (layers "F.Cu"))
+  )
+)
+"""
+
+
+def test_no_net_pad_via_keepout_uses_routed_net_via_geometry():
+    """A NO-NET pad must keep a via away by (routed via)/2 + clearance + pad
+    half-size — priced at the ROUTED net's geometry, not the global.
+
+    Pad half-width 0.5, clearance 0.2. At the 0.45 global via the keep-out
+    reaches 0.5 + 0.2 + 0.225 = 0.925 mm from the pad centre; with a 0.9 mm
+    class via it reaches 0.5 + 0.2 + 0.45 = 1.15 mm. A probe 1.05 mm out is
+    therefore legal at the global and MUST be blocked once the routed net
+    carries the bigger via.
+    """
+    from obstacle_map import build_base_obstacle_map
+
+    fd, path = tempfile.mkstemp(suffix='.kicad_pcb', prefix='cvg_ncpad_')
+    os.close(fd)
+    try:
+        with open(path, 'w') as f:
+            f.write(NC_PAD_BOARD)
+        pcb = parse_kicad_pcb(path)
+    finally:
+        os.unlink(path)
+
+    coord = GridCoord(0.1)
+    probe = coord.to_grid(16.05, 10.0)   # 1.05 mm right of the pad centre
+
+    def _build(geometry):
+        config = GridRouteConfig(track_width=0.2, clearance=0.2,
+                                 via_size=0.45, via_drill=0.2, grid_step=0.1,
+                                 hole_to_hole_clearance=0.2, layers=LAYERS,
+                                 net_via_geometry=geometry)
+        # Route net 1 (SIG); the no-net pad is a foreign obstacle.
+        return build_base_obstacle_map(pcb, config, [1])
+
+    assert not _build({}).is_via_blocked(*probe), \
+        'global-geometry keep-out should leave 1.05 mm open'
+    assert _build({1: (0.9, 0.4)}).is_via_blocked(*probe), \
+        'a 0.9 mm class via must be blocked 1.05 mm from a no-net pad'
+
+
+def test_no_net_pad_is_stamped_at_all():
+    """The no-net pad must be an obstacle in the first place: net 0 is a real
+    copper feature, and skipping it is how a via ends up on top of one."""
+    from obstacle_map import build_base_obstacle_map
+
+    fd, path = tempfile.mkstemp(suffix='.kicad_pcb', prefix='cvg_ncpad2_')
+    os.close(fd)
+    try:
+        with open(path, 'w') as f:
+            f.write(NC_PAD_BOARD)
+        pcb = parse_kicad_pcb(path)
+    finally:
+        os.unlink(path)
+    coord = GridCoord(0.1)
+    config = GridRouteConfig(track_width=0.2, clearance=0.2,
+                             via_size=0.45, via_drill=0.2, grid_step=0.1,
+                             hole_to_hole_clearance=0.2, layers=LAYERS)
+    om = build_base_obstacle_map(pcb, config, [1])
+    centre = coord.to_grid(15.0, 10.0)
+    assert om.is_blocked(centre[0], centre[1], 0), 'no-net pad copper must block tracks'
+    assert om.is_via_blocked(*centre), 'no-net pad must block vias'

@@ -259,12 +259,14 @@ def build_base_obstacle_map(pcb_data: PCBData, config: GridRouteConfig,
             if id(pad) in _tie_partner_pad_ids:
                 _rec = _RecordingObstacles(obstacles)
                 _add_pad_obstacle(_rec, pad, coord, layer_map, config, extra_clearance,
-                                  clearance_override=_obstacle_clearance(net_id))
+                                  clearance_override=_obstacle_clearance(net_id),
+                                  routing_via_size=_route_via_size)
                 if _rec.cell_batches:
                     _tie_recorded.append(('pad', id(pad), _rec.merged_cells()))
                 continue
             _add_pad_obstacle(obstacles, pad, coord, layer_map, config, extra_clearance,
-                              clearance_override=_obstacle_clearance(net_id))
+                              clearance_override=_obstacle_clearance(net_id),
+                              routing_via_size=_route_via_size)
 
     # Intersect each tied net's corridor with the recorded tie-copper stamps:
     # the per-net lift arrays are EXACT subsets of what the base build added
@@ -2522,6 +2524,7 @@ def _add_pad_obstacle(obstacles: GridObstacleMap, pad, coord: GridCoord,
                       layer_map: Dict[str, int], config: GridRouteConfig,
                       extra_clearance: float = 0.0,
                       blocked_cells: List[Set[Tuple[int, int]]] = None,
+                      routing_via_size: Optional[float] = None,
                       blocked_vias: Set[Tuple[int, int]] = None,
                       clearance_override: float = None,
                       skip_cell=None):
@@ -2589,7 +2592,13 @@ def _add_pad_obstacle(obstacles: GridObstacleMap, pad, coord: GridCoord,
         expanded_layers = expand_pad_layers(pad.layers, config.layers)
         clr_groups = _clr_groups(expanded_layers)
         on_copper = any(l.endswith('.Cu') for l in expanded_layers)
-        via_margin = config.via_size / 2 + _via_clr(expanded_layers) + extra_clearance
+        # The via we are ABOUT TO PLACE is priced at the routed net's own
+        # geometry, not the run-global (#NC-pad): with contract per-net via
+        # geometry a 0.6 mm class via was measured against a 0.3 mm keep-out
+        # and landed 0.106 mm from U321's no-net pad 15 on LP50 Rev A, in
+        # breach of both the 0.2 netclass clearance and the 0.25 hole floor.
+        _pad_vs = routing_via_size if routing_via_size is not None else config.via_size
+        via_margin = _pad_vs / 2 + _via_clr(expanded_layers) + extra_clearance
 
         def _emit(poly, m, via_pass, layer_idxs=None):
             gxf, gyf, inside, edist = _rasterize_polygon(poly, coord, m)
@@ -2660,7 +2669,13 @@ def _add_pad_obstacle(obstacles: GridObstacleMap, pad, coord: GridCoord,
 
     # Via blocking near pads - block vias if pad is on any copper layer
     if any(layer.endswith('.Cu') for layer in expanded_layers):
-        via_margin = config.via_size / 2 + _via_clr(expanded_layers) + extra_clearance
+        # The via we are ABOUT TO PLACE is priced at the routed net's own
+        # geometry, not the run-global (#NC-pad): with contract per-net via
+        # geometry a 0.6 mm class via was measured against a 0.3 mm keep-out
+        # and landed 0.106 mm from U321's no-net pad 15 on LP50 Rev A, in
+        # breach of both the 0.2 netclass clearance and the 0.25 hole floor.
+        _pad_vs = routing_via_size if routing_via_size is not None else config.via_size
+        via_margin = _pad_vs / 2 + _via_clr(expanded_layers) + extra_clearance
         via_cells = pad_blocked_cells_array(gx, gy, half_width, half_height, via_margin,
                                             config.grid_step, corner_radius, corner_buffer,
                                             off_x, off_y, rotation_deg=pad.rect_rotation)
@@ -2705,7 +2720,9 @@ def _pad_via_keepout_cells(pad, coord: GridCoord, config: GridRouteConfig,
     else:
         corner_radius = 0
     corner_buffer = coord.grid_step * 0.75 if extra_clearance > 0 else None
-    via_margin = config.via_size / 2 + clearance + extra_clearance
+    # Same per-net pricing as the polygon path above.
+    _pad_vs = routing_via_size if routing_via_size is not None else config.via_size
+    via_margin = _pad_vs / 2 + clearance + extra_clearance
     return pad_blocked_cells_array(gx, gy, half_width, half_height, via_margin,
                                    config.grid_step, corner_radius, corner_buffer,
                                    off_x, off_y, rotation_deg=pad.rect_rotation)
