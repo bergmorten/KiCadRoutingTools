@@ -1317,7 +1317,7 @@ def tap_pad_with_escalation(
         # caller's -- a pad the caller's via already fits ('fits'), or a pad so
         # small the clamp can't shrink below the fab floor it's already at, leaves
         # the via unchanged and must not emit a misleading escalation warning.
-        if cvs < via_size - 1e-9:
+        if cvs < via_size - 1e-9 and getattr(config, 'allow_via_shrink', True):   # #564
             fine_via_size, fine_via_drill = cvs, cvd
             if vrung > 0:
                 warn_fab_escalation(f"plane tap {pad.component_ref}.{pad.pad_number}")

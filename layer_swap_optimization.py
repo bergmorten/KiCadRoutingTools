@@ -150,6 +150,8 @@ def _swap_vias_fit_or_shrink(pcb_data, new_vias, config) -> bool:
         return True
     if _bare_pad_pair_vias_fit(pcb_data, new_vias, config)[0]:
         return True
+    if not getattr(config, 'allow_via_shrink', True):
+        return False    # #564: never trade the via size for a fit
     from fab_tiers import fab_floor_for_param
     copper = sum(1 for l in config.layers if l.endswith('.Cu'))
     via_floor = fab_floor_for_param('via_diameter', copper) or 0.25

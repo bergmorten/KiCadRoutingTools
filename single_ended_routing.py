@@ -518,7 +518,7 @@ def _unblock_via_refit(pcb_data, net_id, x, y, rec, config):
     layers = [l for l in (pcb_data.board_info.copper_layers or []) if l.endswith('.Cu')]
     ncu = len(layers) or 2
     cands = [rec]
-    for f in fab_floor_ladder(ncu):
+    for f in (fab_floor_ladder(ncu) if getattr(config, 'allow_via_shrink', True) else ()):   # #564
         pair = (round(f['via_diameter'], 3), round(f['via_drill'], 3))
         if pair[0] < rec[0] - 1e-9 and pair not in cands:
             cands.append(pair)
@@ -1932,8 +1932,13 @@ def _place_shrunk_via_in_pad(pad_obj, obstacles, config, pcb_data, net_id, coord
     # never grow above it.
     _nvs, _nvd = get_net_via_geometry(config, net_id)
     candidates = [(_nvs, _nvd, False)]
-    candidates += [(f['via_diameter'], f['via_drill'], i > 0)
-                   for i, f in enumerate(ladder)]
+    # #564: a via smaller than the class is a FAB-TIER decision (one 0.15 mm hole
+    # moves the whole order onto the advanced tier), not a routing convenience.
+    # With shrinking forbidden the rescue may still place the configured via in
+    # the pad; if that does not fit, the net fails honestly and names the pad.
+    if getattr(config, 'allow_via_shrink', True):
+        candidates += [(f['via_diameter'], f['via_drill'], i > 0)
+                       for i, f in enumerate(ladder)]
     via_pairs, seen_dia, escalated_pair = [], set(), set()
     for vd, dr, is_esc in candidates:
         vd, dr = round(vd, 3), round(dr, 3)

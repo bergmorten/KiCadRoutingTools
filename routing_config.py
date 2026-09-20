@@ -97,6 +97,10 @@ class GridRouteConfig:
     clearance: float = 0.1  # mm between tracks
     via_size: float = 0.3  # mm via outer diameter
     via_drill: float = 0.2  # mm via drill
+    # #564: may a rescue/escalation place a via SMALLER than the configured one? A real
+    # dataclass field, not a dynamic attribute, so dataclasses.replace() copies carry it --
+    # net_rescue and the tap ladders work on replace(config, ...) copies.
+    allow_via_shrink: bool = True
     grid_step: float = 0.1  # mm grid resolution
     via_cost: int = 50  # grid steps equivalent penalty for via
     layers: List[str] = field(default_factory=lambda: ['F.Cu', 'B.Cu'])

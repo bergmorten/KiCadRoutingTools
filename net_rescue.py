@@ -202,7 +202,7 @@ def _rescue_rungs(config, fine_grid, pcb_data, net_id):
     from fab_tiers import fab_floor_ladder, warn_fab_escalation
     n_layers = len(pcb_data.board_info.copper_layers) or 2
     _ladder = fab_floor_ladder(n_layers)
-    for floor in _ladder:
+    for floor in (_ladder if getattr(config, 'allow_via_shrink', True) else ()):   # #564
         v_dia, v_drill = floor['via_diameter'], floor['via_drill']
         if v_dia >= config.via_size - 1e-9:
             continue

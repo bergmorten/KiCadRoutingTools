@@ -871,8 +871,9 @@ def fitting_pad_via(pad_x: float, pad_y: float, net_id: int, pcb_data: PCBData,
     # class size when the field forces it, never above.
     _nvs, _nvd = get_net_via_geometry(config, net_id)
     candidates = [(_nvs, _nvd)]
-    candidates += [(f['via_diameter'], f['via_drill']) for f in ladder
-                   if f['via_diameter'] < _nvs - 1e-9]
+    if getattr(config, 'allow_via_shrink', True):   # #564
+        candidates += [(f['via_diameter'], f['via_drill']) for f in ladder
+                       if f['via_diameter'] < _nvs - 1e-9]
     for i, (v_dia, v_drill) in enumerate(candidates):
         clear, _ = via_barrel_clear_of_foreign_copper(
             pad_x, pad_y, net_id, pcb_data, config, exclude_net_ids,
