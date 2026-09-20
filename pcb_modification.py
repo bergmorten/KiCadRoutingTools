@@ -4203,6 +4203,583 @@ def nudge_grazing_vias(results, pcb_data: PCBData, scope_net_ids=None,
     return moved, len(nets_changed_set), moves
 
 
+def stamp_plane_pad_vias(pcb_data, config, scope_net_ids=None,
+                         annular_margin: float = 0.0,
+                         via_size: float = None, via_drill: float = None,
+                         net_via_geometry=None,
+                         skip_pads=None,
+                         dogbone_max_mm: float = 1.3,
+                         anchors=None,
+                         cap_stub_max_mm: float = 3.5,
+                         fanout_refs=None):
+    """Fan every SMD pad of a PLANE net out to its pour before routing (#561, #562).
+
+    A net that owns a filled zone is not routed, it is TAPPED: each of its pads
+    wants the shortest possible path to the pour. Left to the multi-point router
+    the same net is an MST like any other, so it chains pads together across
+    surface copper and runs the whole group to one distant via -- four header
+    ground pins joined by a wide F.Cu fan, five ESD-diode grounds strung down a
+    column into a trunk that walks past three stitching vias to reach a fourth.
+    That is a long shared return path wearing the shape of a ground connection.
+
+    Two shapes, chosen per pad, and this is the whole fanout discipline:
+
+      via-in-pad   the via fits wholly inside the pad -> it goes at the centre.
+      dog-bone     it does not fit (0.4 mm-pitch ICs, 0402/0603 diodes) -> the via
+                   goes on the nearest clear spot within ``dogbone_max_mm`` of the
+                   pad, wholly OUTSIDE the pad so it never straddles the pad edge,
+                   and a short stub on the pad's own layer joins the two.
+
+    Both are placed BEFORE any routing phase, so the pad is already connected
+    when the router looks, the MST for that net collapses to nothing, and the
+    chaining copper is never authored. That is the difference from a cleanup pass,
+    which can only improve copper the router already committed.
+
+    ``skip_pads`` ({"REF.PIN", ...}) names pads that must NOT be tapped: an IC's
+    power pin belongs on a short track to its bypass capacitor, whose pad then
+    carries the via -- the decoupling loop is pin -> cap -> plane, not pin -> plane
+    with the cap hanging off the side. kad knows pin types (the .kicad_pcb kad
+    writes carries none), so the caller passes the list.
+
+    A pad is skipped -- never forced -- when its net owns no zone, it is
+    through-hole (its own barrel already crosses every layer), the pad centre is
+    outside the pour, or no clear via position exists. Every via and stub placed
+    clears foreign copper on each layer, honours hole-to-hole against every drill
+    including pad barrels, and keeps the board-edge clearance. Via-in-pad needs
+    IPC-4761 Type VII from the fab; the counts are printed so a run cannot create
+    the requirement silently.
+
+    Returns (vias, segments): created objects, also appended to ``pcb_data``. The
+    caller owns putting them on its write-list.
+    """
+    from kicad_parser import Via, Segment, pad_drill_circles
+    from single_ended_routing import (_seg_foreign_pad_dist, _seg_foreign_seg_dist,
+                                      _seg_foreign_via_dist)
+    from check_drc import (board_edge_geometry, _point_on_board,
+                           _point_to_rings_distance)
+    from check_connected import point_in_polygon
+    from net_queries import expand_pad_layers
+    import numpy as _np
+
+    board_info = getattr(pcb_data, 'board_info', None)
+    copper_layers = list(getattr(board_info, 'copper_layers', None) or ['F.Cu', 'B.Cu'])
+    edge_rings, edge_outer, edge_cutouts = board_edge_geometry(board_info)
+    board_bounds = getattr(board_info, 'board_bounds', None)
+    base_clr = getattr(config, 'clearance', 0.1)
+    h2h = getattr(config, 'hole_to_hole_clearance', 0.2)
+    net_clearances = getattr(config, 'net_clearances', None) or None
+    net_widths = getattr(config, 'net_track_widths', None) or {}
+    skip = set(skip_pads or ())
+    TOL = 1e-4
+
+    zones_by_net = {}
+    for z in (getattr(pcb_data, 'zones', []) or []):
+        if scope_net_ids is not None and z.net_id not in scope_net_ids:
+            continue
+        zones_by_net.setdefault(z.net_id, []).append(z)
+    # #565: components to fan out COMPLETELY -- every SMD pad, whatever its net, gets a
+    # via-in-pad or a dog-bone before routing. This is the classic fine-pitch fanout
+    # (a 0.4 mm-pitch UQFN's 0.2 mm-wide pads have exactly one legal exit each, and a
+    # router that meets them last finds that exit already taken). The router then joins
+    # via to via, which is the easy problem.
+    fanout_refs = set(fanout_refs or ())
+    if not zones_by_net and not fanout_refs:
+        return [], []
+
+    def eff_clr(nid):
+        if not net_clearances:
+            return base_clr
+        return max(base_clr, net_clearances.get(nid, base_clr))
+
+    def geom_for(net_id):
+        if net_via_geometry and net_id in net_via_geometry:
+            return net_via_geometry[net_id]
+        return (via_size if via_size else config.via_size,
+                via_drill if via_drill else config.via_drill)
+
+    holes = [(v.x, v.y, (getattr(v, 'drill', 0) or 0) / 2.0)
+             for v in pcb_data.vias if (getattr(v, 'drill', 0) or 0) > 0]
+    for fp in pcb_data.footprints.values():
+        for p in fp.pads:
+            if (p.drill or 0) > 0:
+                for hx, hy, hd in pad_drill_circles(p):
+                    holes.append((hx, hy, hd / 2.0))
+    hx_a = _np.asarray([h[0] for h in holes], dtype=float)
+    hy_a = _np.asarray([h[1] for h in holes], dtype=float)
+    hr_a = _np.asarray([h[2] for h in holes], dtype=float)
+
+    def via_clear_at(net_id, x, y, size, drill):
+        eff = eff_clr(net_id)
+        thr = eff + size / 2.0 - TOL
+        if _seg_foreign_via_dist(pcb_data, net_id, x, y, x, y, copper_layers[0],
+                                 base_clearance=eff, net_clearances=net_clearances) < thr:
+            return False
+        for lyr in copper_layers:
+            if _seg_foreign_seg_dist(pcb_data, net_id, x, y, x, y, lyr,
+                                     base_clearance=eff, net_clearances=net_clearances) < thr:
+                return False
+            if _seg_foreign_pad_dist(pcb_data, net_id, x, y, x, y, lyr,
+                                     base_clearance=eff, net_clearances=net_clearances) < thr:
+                return False
+        if drill > 0 and hx_a.size:
+            d = _np.hypot(hx_a - x, hy_a - y)
+            if bool((d < drill / 2.0 + hr_a + h2h - TOL).any()):
+                return False
+        if edge_rings:
+            if not _point_on_board(x, y, edge_outer, edge_cutouts):
+                return False
+            if (_point_to_rings_distance(x, y, edge_rings) - (size / 2.0 + base_clr)) < -TOL:
+                return False
+        elif board_bounds:
+            bx0, by0, bx1, by1 = board_bounds
+            if (min(x - bx0, bx1 - x, y - by0, by1 - y) - (size / 2.0 + base_clr)) < -TOL:
+                return False
+        return True
+
+    def stub_clear(net_id, x1, y1, x2, y2, width, layer):
+        eff = eff_clr(net_id)
+        need = width / 2.0 + eff - TOL
+        for fn in (_seg_foreign_pad_dist, _seg_foreign_seg_dist, _seg_foreign_via_dist):
+            if fn(pcb_data, net_id, x1, y1, x2, y2, layer,
+                  base_clearance=eff, net_clearances=net_clearances) < need:
+                return False
+        return True
+
+    def in_pour(nid, x, y):
+        if nid not in zones_by_net:
+            return True          # a fanout-ref signal pad: no pour to be inside of
+        return any(z.polygon and point_in_polygon(x, y, z.polygon) for z in zones_by_net[nid])
+
+    def already_tapped(nid, x, y):
+        return any(abs(v.x - x) < TOL and abs(v.y - y) < TOL and v.net_id == nid
+                   for v in pcb_data.vias)
+
+    # Idempotent: route.py re-enters batch_route on its retry/second phase, and a
+    # second pass must not fan out a pad that already has a via-in-pad OR a dog-bone.
+    # Measured: the second pass minted 10 more dog-bones onto pads that already had one.
+    if getattr(pcb_data, '_plane_fanout_done', False):
+        return [], []
+    pcb_data._plane_fanout_done = True
+
+    def has_stub(nid, x, y):
+        return any(s.net_id == nid and (
+            (abs(s.start_x - x) < 0.05 and abs(s.start_y - y) < 0.05) or
+            (abs(s.end_x - x) < 0.05 and abs(s.end_y - y) < 0.05))
+            for s in pcb_data.segments)
+
+    vias, segs = [], []
+    n_inpad = n_dogbone = n_small_blocked = n_clear_blocked = n_skipped = 0
+    span = [copper_layers[0], copper_layers[-1]]
+
+    # --- bypass stubs first, on ANY net (#563) ------------------------------------
+    # `REF.PIN=REF.PIN` is "this pin's copper goes to that pad first". For a plane net
+    # that is pin -> bypass cap -> plane; for a module supply like NORA_VCC it is
+    # ball -> bypass cap before the net wanders off to its test point and 0R link. A
+    # straight stub on the pin's layer, laid before routing and locked, is what makes
+    # the loop short by construction instead of by luck: the same route came back with
+    # the bypass through two vias and an inner layer on one run and direct on the next.
+    _all_pads = {f"{q.component_ref}.{q.pad_number}": q
+                 for fp in pcb_data.footprints.values() for q in fp.pads}
+    for _pin_key, _cap_key in sorted((anchors or {}).items()):
+        _pin, _cap = _all_pads.get(_pin_key), _all_pads.get(_cap_key)
+        if _pin is None or _cap is None or _pin.net_id != _cap.net_id:
+            print(f"  bypass {_pin_key} -> {_cap_key}: not two pads of one net -- ignored")
+            continue
+        nid = _pin.net_id
+        px, py = round(_pin.global_x, 4), round(_pin.global_y, 4)
+        cx, cy = round(_cap.global_x, 4), round(_cap.global_y, 4)
+        if has_stub(nid, px, py):
+            continue
+        dist = math.hypot(cx - px, cy - py)
+        layers_ = [l for l in expand_pad_layers(_pin.layers, config.layers) if l in ('F.Cu', 'B.Cu')]
+        # As wide as both pads allow, capped at 0.4 mm: a bypass stub is the supply's
+        # last inch, and the netclass width may not have reached `config` yet when this
+        # runs (it came back 0.15 mm for a 0.4 mm POWER class).
+        # widest first, then narrower: U4.8 -> C10.1 fits at 0.15 mm but a 0.4 mm stub
+        # grazes the neighbouring pin, and a narrow stub beats no stub.
+        width_max = max(0.15, min(0.4, min(_pin.size_x, _pin.size_y), min(_cap.size_x, _cap.size_y)))
+        width = None
+        if layers_ and dist <= cap_stub_max_mm:
+            for w_try in (0.4, 0.3, 0.25, 0.2, 0.15):
+                if w_try <= width_max + 1e-9 and stub_clear(nid, px, py, cx, cy, w_try, layers_[0]):
+                    width = w_try
+                    break
+        if width is not None:
+            sg = Segment(start_x=px, start_y=py, end_x=cx, end_y=cy, width=width,
+                         layer=layers_[0], net_id=nid)
+            sg.locked = True
+            pcb_data.segments.append(sg); segs.append(sg)
+            pcb_data._foreign_seg_arr_cache = None
+            n_skipped += 1
+            print(f"  bypass {_pin_key} -> {_cap_key}: {dist:.2f} mm stub, {width} mm wide")
+        else:
+            print(f"  bypass {_pin_key} -> {_cap_key}: cap is {dist:.2f} mm away"
+                  f"{'' if dist <= cap_stub_max_mm else f' (> {cap_stub_max_mm} mm)'} or a straight stub is blocked"
+                  f" -- pin gets normal fanout; move the cap (placement)")
+    for fp in pcb_data.footprints.values():
+        fx, fy = getattr(fp, 'x', None), getattr(fp, 'y', None)
+        for p in fp.pads:
+            nid = getattr(p, 'net_id', 0)
+            if getattr(p, 'pad_type', '') != 'smd':
+                continue
+            if nid not in zones_by_net and getattr(p, 'component_ref', '') not in fanout_refs:
+                continue
+            if not nid:
+                continue          # unconnected pad: nothing to fan out
+            px, py = round(p.global_x, 4), round(p.global_y, 4)
+            _key = f"{p.component_ref}.{p.pad_number}"
+            if not in_pour(nid, px, py) or already_tapped(nid, px, py) or has_stub(nid, px, py):
+                continue
+            size, drill = geom_for(nid)
+            r = size / 2.0
+            hx, hy = p.size_x / 2.0, p.size_y / 2.0
+
+            # --- via-in-pad ---------------------------------------------------
+            if r + annular_margin <= min(hx, hy) + TOL:
+                if not via_clear_at(nid, px, py, size, drill):
+                    n_clear_blocked += 1
+                    continue
+                v = Via(x=px, y=py, size=size, drill=drill, layers=list(span), net_id=nid,
+                        locked=True)
+                pcb_data.vias.append(v); vias.append(v)
+                pcb_data._foreign_via_arr_cache = None
+                n_inpad += 1
+                continue
+
+            # --- dog-bone -----------------------------------------------------
+            pad_layers = [l for l in expand_pad_layers(p.layers, config.layers)
+                          if l in ('F.Cu', 'B.Cu')]
+            if not pad_layers:
+                n_small_blocked += 1
+                continue
+            layer = pad_layers[0]
+            width = max(0.15, min(net_widths.get(nid, getattr(config, 'track_width', 0.15)),
+                                  2.0 * min(hx, hy)))
+            # outward = away from the footprint centre, so the stub leaves the part
+            # rather than running under its body
+            ox, oy = (px - fx, py - fy) if fx is not None else (0.0, 0.0)
+            on = math.hypot(ox, oy)
+            ox, oy = (ox / on, oy / on) if on > 1e-9 else (0.0, 0.0)
+            best = None
+            for step in range(0, int((dogbone_max_mm - 0.4) / 0.05) + 1):
+                dist = 0.4 + 0.05 * step
+                for k in range(16):
+                    a = 2 * math.pi * k / 16
+                    dx, dy = math.cos(a), math.sin(a)
+                    cx, cy = round(px + dist * dx, 4), round(py + dist * dy, 4)
+                    # wholly outside its own pad: no straddled pad edge
+                    if abs(cx - px) < hx + r + 0.05 and abs(cy - py) < hy + r + 0.05:
+                        continue
+                    if not in_pour(nid, cx, cy) or already_tapped(nid, cx, cy):
+                        continue
+                    if not via_clear_at(nid, cx, cy, size, drill):
+                        continue
+                    if not stub_clear(nid, px, py, cx, cy, width, layer):
+                        continue
+                    score = (round(dist, 2), -(dx * ox + dy * oy))
+                    if best is None or score < best[0]:
+                        best = (score, cx, cy)
+                if best is not None:
+                    break
+            if best is None:
+                n_small_blocked += 1
+                continue
+            _, cx, cy = best
+            v = Via(x=cx, y=cy, size=size, drill=drill, layers=list(span), net_id=nid,
+                    locked=True)
+            sg = Segment(start_x=px, start_y=py, end_x=cx, end_y=cy, width=width,
+                         layer=layer, net_id=nid)
+            sg.locked = True
+            pcb_data.vias.append(v); pcb_data.segments.append(sg)
+            vias.append(v); segs.append(sg)
+            pcb_data._foreign_via_arr_cache = None
+            pcb_data._foreign_seg_arr_cache = None
+            n_dogbone += 1
+
+    if vias or n_small_blocked or n_clear_blocked or n_skipped:
+        print(f"Plane pad fanout: {n_inpad} via-in-pad, {n_dogbone} dog-bone(s); "
+              f"{n_skipped} pin(s) stubbed to their bypass cap, "
+              f"{n_small_blocked} with no clear via position within {dogbone_max_mm} mm, "
+              f"{n_clear_blocked} blocked by foreign copper")
+    return vias, segs
+
+
+def center_vias_in_same_net_pads(results, pcb_data, scope_net_ids=None,
+                                 clearance: float = 0.1,
+                                 hole_to_hole: float = 0.20,
+                                 net_clearances=None,
+                                 board_edge_clearance: float = 0.0,
+                                 annular_margin: float = 0.0,
+                                 layer_clearance=None,
+                                 stack_clearance=None):
+    """Snap an escape via that CLIPS its own pad to the pad centre (#560).
+
+    The single-ended router lands a layer-transition via wherever the A* path
+    happens to change layer. Its own net's pad is not an obstacle, so on a BGA
+    escape the via is committed a grid node or two off the ball centre and its
+    barrel ends up STRADDLING the pad boundary: half in copper, half in solder
+    mask. That is the one placement with no defence. A via wholly outside the
+    pad is a normal dog-bone; a via wholly inside is via-in-pad, which the fab
+    fills and caps (IPC-4761 Type VII, see fab_notes). A via on the EDGE is
+    neither: solder wicks down the exposed barrel during reflow and starves the
+    joint, and no DRC reports it, because a via inside a pad is adopted by that
+    pad's net and reads as connected.
+
+    Measured on an 82-ball NORA-B206 escape at 0.025mm grid: 53 vias clipped a
+    pad edge, every U1 ball at a pure 45-degree offset of 0.200 or 0.325mm --
+    the latter exactly one grid step beyond the 0.300mm pad half-width. None of
+    them was at a ball centre, and a 0.5mm via fits inside a 0.6mm ball with
+    0.05mm of pad copper all round.
+
+    So: when a via already overlaps a SAME-NET pad and FITS wholly inside it,
+    move it to that pad's centre. The pass never creates a new via-in-pad site
+    that was not already one, and never moves a via that cannot fit -- a pad too
+    small (a 0.5mm pitch DSE land, 0.30mm tall) keeps its clipping via and stays
+    visible, because shrinking the via to make it fit is a fab-tier decision the
+    router does not get to take silently.
+
+    Unlike nudge_grazing_vias this move is NOT capped at via_size/4, so the
+    attached track ends cannot be assumed to stay buried in the via body: every
+    same-net segment endpoint coincident with the old position is DRAGGED to the
+    new one, the way merge_close_same_net_vias reconnects to a survivor. Dragged
+    copper runs further INTO the pad it already terminated on, so the added
+    length lies in same-net copper -- but it is re-validated against foreign
+    copper anyway, and the whole move is reverted if per-net connectivity comes
+    back worse.
+
+    Only copper CREATED BY THIS RUN may move: the writers re-emit this run's
+    vias and segments but keep the input file's text for pre-existing ones, so
+    dragging an input segment would silently revert and strand the via.
+
+    Returns (vias_centred, nets_changed, moves) with moves =
+    [(net_id, old_x, old_y, new_x, new_y)].
+    """
+    from collections import defaultdict
+    from check_connected import check_net_connectivity
+    from single_ended_routing import (_seg_foreign_pad_dist, _seg_foreign_seg_dist,
+                                      _seg_foreign_via_dist)
+    from check_drc import (board_edge_geometry, _point_on_board,
+                           _point_to_rings_distance)
+
+    board_info = getattr(pcb_data, 'board_info', None)
+    copper_layers = list(getattr(board_info, 'copper_layers', None) or ['F.Cu', 'B.Cu'])
+    edge_rings, edge_outer, edge_cutouts = board_edge_geometry(board_info)
+    board_bounds = getattr(board_info, 'board_bounds', None)
+    _edge_clr = max(clearance, board_edge_clearance)
+    TOL = 1e-4
+
+    def eff_clr(nid):
+        if not net_clearances:
+            return clearance
+        return max(clearance, net_clearances.get(nid, clearance))
+
+    def worse(before, after):
+        return ((before.get('connected') and not after.get('connected')) or
+                len(after.get('disconnected_pads') or []) > len(before.get('disconnected_pads') or []) or
+                (after.get('num_components') or 1) > (before.get('num_components') or 1))
+
+    # Every drill hole on the board -- hole-to-hole is a fab rule, not an
+    # electrical one, so same-net holes count too.
+    import numpy as _np
+    from kicad_parser import pad_drill_circles
+    hole_list = [(id(v), v.x, v.y, (getattr(v, 'drill', 0) or 0) / 2.0)
+                 for v in pcb_data.vias if (getattr(v, 'drill', 0) or 0) > 0]
+    for fp in pcb_data.footprints.values():
+        for p in fp.pads:
+            if (p.drill or 0) > 0:
+                for hx, hy, hd in pad_drill_circles(p):
+                    hole_list.append((id(p), hx, hy, hd / 2.0))
+    hole_x = _np.asarray([h[1] for h in hole_list], dtype=float)
+    hole_y = _np.asarray([h[2] for h in hole_list], dtype=float)
+    hole_r = _np.asarray([h[3] for h in hole_list], dtype=float)
+    hole_owner = [h[0] for h in hole_list]
+
+    def lyr_clr(lyr, eff):
+        # #498: a .kicad_dru rule on `lyr` REPLACES the pair clearance there. The
+        # dru e2e caught this pass grading B.Cu at the global 0.2 under a 0.5 rule.
+        return layer_clearance(lyr, eff) if layer_clearance else eff
+
+    def via_clear_at(v, x, y):
+        """True when a via of v's geometry clears every FOREIGN object at (x, y)."""
+        eff = eff_clr(v.net_id)
+        # via-to-via spans the whole stack: the strictest ruled layer governs
+        eff_stack = (stack_clearance(eff) if stack_clearance
+                     else max(lyr_clr(l, eff) for l in copper_layers))
+        if _seg_foreign_via_dist(pcb_data, v.net_id, x, y, x, y, copper_layers[0],
+                                 base_clearance=eff_stack,
+                                 net_clearances=net_clearances) < eff_stack + v.size / 2.0 - TOL:
+            return False
+        for lyr in copper_layers:
+            eff_l = lyr_clr(lyr, eff)
+            thr = eff_l + v.size / 2.0 - TOL
+            if _seg_foreign_seg_dist(pcb_data, v.net_id, x, y, x, y, lyr,
+                                     base_clearance=eff_l, net_clearances=net_clearances) < thr:
+                return False
+            if _seg_foreign_pad_dist(pcb_data, v.net_id, x, y, x, y, lyr,
+                                     base_clearance=eff_l, net_clearances=net_clearances) < thr:
+                return False
+        vd = (getattr(v, 'drill', 0) or 0) / 2.0
+        if vd > 0 and hole_x.size:
+            d = _np.hypot(hole_x - x, hole_y - y)
+            mask = d < vd + hole_r + hole_to_hole - TOL
+            for i, owner in enumerate(hole_owner):
+                if owner == id(v):
+                    mask[i] = False
+            if bool(mask.any()):
+                return False
+        if edge_rings:
+            if not _point_on_board(x, y, edge_outer, edge_cutouts):
+                return False
+            if (_point_to_rings_distance(x, y, edge_rings)
+                    - (v.size / 2.0 + _edge_clr)) < -TOL:
+                return False
+        elif board_bounds:
+            bx0, by0, bx1, by1 = board_bounds
+            if (min(x - bx0, bx1 - x, y - by0, by1 - y)
+                    - (v.size / 2.0 + _edge_clr)) < -TOL:
+                return False
+        return True
+
+    def seg_clear(s, x1, y1, x2, y2):
+        """True when segment s, re-laid to (x1,y1)-(x2,y2), clears foreign copper."""
+        eff = lyr_clr(s.layer, eff_clr(s.net_id))
+        need = s.width / 2.0 + eff - TOL
+        if _seg_foreign_pad_dist(pcb_data, s.net_id, x1, y1, x2, y2, s.layer,
+                                 base_clearance=eff, net_clearances=net_clearances) < need:
+            return False
+        if _seg_foreign_seg_dist(pcb_data, s.net_id, x1, y1, x2, y2, s.layer,
+                                 base_clearance=eff, net_clearances=net_clearances) < need:
+            return False
+        if _seg_foreign_via_dist(pcb_data, s.net_id, x1, y1, x2, y2, s.layer,
+                                 base_clearance=eff, net_clearances=net_clearances) < need:
+            return False
+        return True
+
+    def pad_local(pad, x, y):
+        """(lx, ly, hx, hy) of (x, y) in the pad's own rotated frame."""
+        rot = math.radians(getattr(pad, 'rect_rotation', 0.0) or 0.0)
+        ca, sa = math.cos(-rot), math.sin(-rot)
+        dx, dy = x - pad.global_x, y - pad.global_y
+        return (dx * ca - dy * sa, dx * sa + dy * ca,
+                pad.size_x / 2.0, pad.size_y / 2.0)
+
+    vias_by_net = defaultdict(list)
+    for v in pcb_data.vias:
+        vias_by_net[v.net_id].append(v)
+    segs_by_net = defaultdict(list)
+    for s in pcb_data.segments:
+        segs_by_net[s.net_id].append(s)
+    zones_by_net = defaultdict(list)
+    for z in (getattr(pcb_data, 'zones', []) or []):
+        zones_by_net[z.net_id].append(z)
+
+    own_via_ids, own_seg_ids = set(), set()
+    for r in results:
+        for v in r.get('new_vias') or []:
+            own_via_ids.add(id(v))
+        for s in r.get('new_segments') or []:
+            own_seg_ids.add(id(s))
+
+    import env_knobs
+    _dbg = env_knobs.VIA_IN_PAD_DEBUG
+    centred = 0
+    nets_changed_set = set()
+    moves = []
+    scoped = [v for v in pcb_data.vias
+              if id(v) in own_via_ids
+              and (scope_net_ids is None or v.net_id in scope_net_ids)]
+
+    for v in scoped:
+        r = v.size / 2.0
+        target = None
+        for p in (pcb_data.pads_by_net.get(v.net_id) or ()):
+            if getattr(p, 'pad_type', '') == 'np_thru_hole':
+                continue
+            lx, ly, hx, hy = pad_local(p, v.x, v.y)
+            # already wholly inside -> nothing to do; wholly outside -> not ours
+            if abs(lx) + r <= hx + TOL and abs(ly) + r <= hy + TOL:
+                target = None
+                break
+            if abs(lx) >= hx + r or abs(ly) >= hy + r:
+                continue
+            # overlaps the pad. Only move it if the via FITS, with the annular
+            # pad copper the caller asks for.
+            if r + annular_margin > min(hx, hy) + TOL:
+                continue
+            target = p
+            break
+        if target is None:
+            if _dbg:
+                print(f"[via-in-pad] no target for via net={v.net_id} at ({v.x},{v.y})")
+            continue
+
+        nx, ny = round(target.global_x, 4), round(target.global_y, 4)
+        if abs(nx - v.x) < TOL and abs(ny - v.y) < TOL:
+            continue
+        if not via_clear_at(v, nx, ny):
+            if _dbg:
+                print(f"[via-in-pad] DECLINE clearance: {target.component_ref}.{target.pad_number} "
+                      f"net={v.net_id} via({v.x},{v.y}) -> ({nx},{ny})")
+            continue
+
+        # Drag every same-net endpoint that sits on the old via position. An
+        # input-file segment cannot be dragged (the writer keeps its text), so
+        # its presence vetoes the move rather than stranding the via.
+        drags = []
+        vetoed = False
+        for s in segs_by_net.get(v.net_id, ()):
+            at_start = abs(s.start_x - v.x) < TOL and abs(s.start_y - v.y) < TOL
+            at_end = abs(s.end_x - v.x) < TOL and abs(s.end_y - v.y) < TOL
+            if not (at_start or at_end):
+                continue
+            if id(s) not in own_seg_ids:
+                vetoed = True
+                break
+            x1, y1 = (nx, ny) if at_start else (s.start_x, s.start_y)
+            x2, y2 = (nx, ny) if at_end else (s.end_x, s.end_y)
+            if not seg_clear(s, x1, y1, x2, y2):
+                vetoed = True
+                break
+            drags.append((s, at_start, at_end, x1, y1, x2, y2))
+        if vetoed:
+            if _dbg:
+                print(f"[via-in-pad] DECLINE drag: {target.component_ref}.{target.pad_number} "
+                      f"net={v.net_id} via({v.x},{v.y})")
+            continue
+
+        net_segs = segs_by_net.get(v.net_id, [])
+        net_pads = pcb_data.pads_by_net.get(v.net_id, [])
+        net_vias = vias_by_net.get(v.net_id, [])
+        net_zones = zones_by_net.get(v.net_id, [])
+        before = check_net_connectivity(v.net_id, net_segs, net_vias, net_pads,
+                                        net_zones, pcb_data=pcb_data)
+
+        old = [(v.x, v.y)] + [(s.start_x, s.start_y, s.end_x, s.end_y)
+                              for s, *_ in drags]
+        v.x, v.y = nx, ny
+        for s, _as, _ae, x1, y1, x2, y2 in drags:
+            s.start_x, s.start_y, s.end_x, s.end_y = x1, y1, x2, y2
+
+        after = check_net_connectivity(v.net_id, net_segs, net_vias, net_pads,
+                                       net_zones, pcb_data=pcb_data)
+        if worse(before, after):
+            v.x, v.y = old[0]
+            for (s, *_), o in zip(drags, old[1:]):
+                s.start_x, s.start_y, s.end_x, s.end_y = o
+            if _dbg:
+                print(f"[via-in-pad] DECLINE connectivity: {target.component_ref}.{target.pad_number} "
+                      f"net={v.net_id}")
+            continue
+
+        centred += 1
+        nets_changed_set.add(v.net_id)
+        moves.append((v.net_id, old[0][0], old[0][1], nx, ny))
+        pcb_data._foreign_seg_arr_cache = None
+        pcb_data._foreign_via_arr_cache = None
+
+    return centred, len(nets_changed_set), moves
+
+
 def _pt_seg_dist_t(x, y, s):
     """(distance, t) from a point to segment s."""
     dx, dy = s.end_x - s.start_x, s.end_y - s.start_y

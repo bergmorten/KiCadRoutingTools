@@ -290,6 +290,13 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
                 clearance: float = defaults.CLEARANCE,
                 via_size: float = defaults.VIA_SIZE,
                 via_drill: float = defaults.VIA_DRILL,
+                via_center_in_pad: bool = True,
+                via_center_annular_margin: float = 0.0,
+                plane_pad_taps: bool = True,
+                plane_pad_tap_annular_margin: float = 0.0,
+                plane_pad_tap_skip=None,
+                allow_via_shrink: bool = True,
+                fanout_refs=None,
                 grid_step: float = 0.1,
                 via_cost: int = 50,
                 max_iterations: int = 200000,
@@ -585,6 +592,16 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
     for _v in pcb_data.vias:
         _orig_via_by_net.setdefault(_v.net_id, []).append(_v)
 
+    # #561: tap every plane-net pad into its pour BEFORE any routing phase. A net
+    # that owns a zone is tapped, not routed, and its shortest path to the pour is
+    # a via in the pad. Left to the multi-point router it is an MST like any other,
+    # so it chains pads across surface copper and runs the group to one distant via
+    # -- every pad on that chain then carries the whole fan's return inductance.
+    # This must run before the FIRST routing phase (there are several) and after
+    # the original-copper snapshot above, so the taps count as this run's copper and
+    # the writer emits them.
+    _plane_tap_vias, _plane_tap_segs = [], []
+
     # Layers must be specified - we can't auto-detect which are ground planes
     if layers is None:
         layers = DEFAULT_4_LAYER_STACK
@@ -809,6 +826,30 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
     if config.corridor_waypoints:
         print(f"Guide corridor: steering routes through {len(config.corridor_waypoints)} "
               f"waypoint(s) from {len(pcb_data.guide_paths)} polyline(s) on {config.guide_corridor_layer}")
+
+    # #561 (see the placeholder above): stamp the plane taps now that `config`
+    # carries the clearances they must respect, and before any routing phase has
+    # authored copper that would block a pad centre.
+    # #562: `REF.PIN` leaves a plane-net pad un-tapped so the router connects it to
+    # its nearest served pad; `REF.PIN=REF.PIN` names WHICH served pad -- the bypass
+    # capacitor's -- so the decoupling loop is pin -> cap -> plane by intent, not by
+    # whichever tapped pad happens to sit closest (a test point beat C13 for U6's VCCB).
+    _tap_skip, _tap_anchors = set(), {}
+    for _item in (plane_pad_tap_skip or ()):
+        _pin, _, _anchor = str(_item).partition('=')
+        _tap_skip.add(_pin)
+        if _anchor:
+            _tap_anchors[_pin] = _anchor
+    config.plane_tap_anchors = _tap_anchors
+    config.allow_via_shrink = allow_via_shrink
+    if plane_pad_taps:
+        from pcb_modification import stamp_plane_pad_vias
+        _plane_tap_vias, _plane_tap_segs = stamp_plane_pad_vias(
+            pcb_data, config, scope_net_ids=None,
+            annular_margin=plane_pad_tap_annular_margin,
+            via_size=via_size, via_drill=via_drill,
+            skip_pads=_tap_skip, anchors=_tap_anchors,
+            fanout_refs=fanout_refs)
 
     # Report keepout zones (issue #27): tracks are blocked from these polygons.
     if config.keepout_enabled and pcb_data.keepout_zones:
@@ -1526,6 +1567,21 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
     rerouted_pairs = state.rerouted_pairs
     remaining_net_ids = state.remaining_net_ids
     results = state.results
+    # #561: the taps ride the all_swap_vias channel, not `results`. A results
+    # entry is the wrong home for them: the write-list is reconciled against the
+    # nets this run ROUTED, and a plane net is deliberately not one of them, so
+    # drop_phantom_copper read all 39 taps as orphan routed copper and removed
+    # them from the board (measured: 62 plane-net vias before the phantom pass,
+    # 23 after -- exactly the taps). all_swap_vias is the existing channel for
+    # copper the writer emits that belongs to no result (#292), and route.py
+    # already folds it into original_via_ids, which is precisely the protection
+    # a tap needs.
+    if _plane_tap_vias:
+        all_swap_vias.extend(_plane_tap_vias)
+    if _plane_tap_segs:
+        # dog-bone stubs: same channel, same reason (#508 finding 13 -- copper the
+        # writer emits that belongs to no result rides all_swap_segments)
+        all_swap_segments.extend(_plane_tap_segs)
 
     # Counters (kept as locals, not aliased from state)
     route_index = 0
@@ -1939,8 +1995,56 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
         original_via_ids=({id(v) for lst in _orig_via_by_net.values() for v in lst}
                           | {id(v) for v in all_swap_vias}),
         keep_input_copper=keep_input_copper,
+        via_center_in_pad=via_center_in_pad,
+        via_center_annular_margin=via_center_annular_margin,
         progress_callback=progress_callback)
     dead_end_input_segments = _cleanup.input_strip_segments if _cleanup is not None else []
+
+    # #565: a fanout via the router never used is a hole for nothing. A plane-net tap
+    # is used by definition (the pour is its other side); a SIGNAL fanout via whose only
+    # copper is its own stub -- the router reached the pad on the surface instead --
+    # ships as a dangling drill and a via_dangling warning. Drop via and stub together;
+    # the pad keeps the router's copper.
+    if _plane_tap_vias:
+        _zone_nets = {z.net_id for z in (getattr(pcb_data, 'zones', []) or [])}
+        _stub_by_pos = {}
+        for _sg in _plane_tap_segs:
+            _stub_by_pos.setdefault((round(_sg.end_x, 3), round(_sg.end_y, 3)), []).append(_sg)
+            _stub_by_pos.setdefault((round(_sg.start_x, 3), round(_sg.start_y, 3)), []).append(_sg)
+        _drop_v, _drop_s = [], []
+        for _v in _plane_tap_vias:
+            if _v.net_id in _zone_nets:
+                continue
+            _key = (round(_v.x, 3), round(_v.y, 3))
+            _stubs = _stub_by_pos.get(_key, [])
+            _own = set(id(_sg) for _sg in _stubs)
+            _stub_layers = {_sg.layer for _sg in _stubs}
+            # USED means copper meets the via on a layer the stub is not on -- the via
+            # actually carries the net through the board. Router copper arriving on the
+            # stub's own layer is the router reaching the pad on the surface, and the
+            # via is still a hole for nothing (KiCad: connected on one layer, dangling).
+            _touch = [_sg for _sg in pcb_data.segments
+                      if _sg.net_id == _v.net_id and id(_sg) not in _own
+                      and ((abs(_sg.start_x - _v.x) < 0.05 and abs(_sg.start_y - _v.y) < 0.05)
+                           or (abs(_sg.end_x - _v.x) < 0.05 and abs(_sg.end_y - _v.y) < 0.05))]
+            if any(_sg.layer not in _stub_layers for _sg in _touch):
+                continue            # carries the net through the board: used
+            _drop_v.append(_v)
+            if not _touch:
+                _drop_s.extend(_stubs)   # nothing met it at all: stub goes too
+            # else: router copper met the via ON the stub's layer -- the via is a hole
+            # for nothing but the junction is real, so the stub stays and the pad keeps
+            # its path (dropping both severed four pads on the first attempt)
+        if _drop_v:
+            _dv, _ds = {id(v) for v in _drop_v}, {id(sg) for sg in _drop_s}
+            pcb_data.vias = [v for v in pcb_data.vias if id(v) not in _dv]
+            pcb_data.segments = [sg for sg in pcb_data.segments if id(sg) not in _ds]
+            all_swap_vias[:] = [v for v in all_swap_vias if id(v) not in _dv]
+            all_swap_segments[:] = [sg for sg in all_swap_segments if id(sg) not in _ds]
+            _plane_tap_vias[:] = [v for v in _plane_tap_vias if id(v) not in _dv]
+            _plane_tap_segs[:] = [sg for sg in _plane_tap_segs if id(sg) not in _ds]
+            print(f"Fanout prune: removed {len(_drop_v)} unused signal fanout via(s) and "
+                  f"{len(_drop_s)} stub(s) the router did not use")
 
     # Issue #220: the output writer copies the INPUT FILE verbatim, then adds the
     # write-list results and strips `segments_to_remove`. So an in-scope net's
@@ -2932,6 +3036,57 @@ For differential pair routing, use route_diff.py:
     parser.add_argument("--via-drill", type=float, default=None,
                         help="Via drill size in mm. Default: the board's Default net-class "
                              f"via_drill (sibling .kicad_pro), else {defaults.VIA_DRILL}.")
+    parser.add_argument("--no-plane-pad-taps", dest="plane_pad_taps",
+                        action="store_false", default=True,
+                        help="Do NOT give each pad of a zone-owning net its own via into the "
+                             "pour before routing. The default gives it one: a plane net is "
+                             "tapped, not routed, and without a tap per pad the multi-point "
+                             "router treats it as an MST -- chaining pads across surface "
+                             "copper to one distant via, so every pad on the chain carries "
+                             "the whole fan's return inductance. A pad is tapped only when "
+                             "it is SMD, the via fits wholly inside it, and the pad centre "
+                             "clears everything; otherwise it is skipped, never forced.")
+    parser.add_argument("--fanout-refs", nargs="*", metavar="REF", default=None,
+                        help="Components to fan out COMPLETELY before routing: every SMD pad, on "
+                             "any net, gets a via-in-pad where the via fits and a dog-bone (via "
+                             "beside the pad plus a short stub) where it does not. Fine-pitch "
+                             "parts (0.4 mm UQFN, 0.5 mm DSE) have one legal exit per pad; a router "
+                             "that reaches them last finds it taken. Plane nets are fanned out "
+                             "regardless; this extends the same discipline to signal pads.")
+    parser.add_argument("--no-via-shrink", dest="allow_via_shrink", action="store_false", default=True,
+                        help="Never place a via smaller than the configured/class size, not even the "
+                             "last-resort via-in-pad rescue or the layer-swap bare-pad fit. One "
+                             "0.15 mm hole moves the whole order onto the fab's advanced tier, so the "
+                             "size is an ORDER decision; with this set a net that only fits with a "
+                             "smaller via fails honestly and names the pad.")
+    parser.add_argument("--plane-tap-skip-pads", nargs="*", metavar="REF.PIN[=REF.PIN]", default=None,
+                        help="Plane-net pads NOT to fan out with their own via, optionally naming "
+                             "the served pad they must route to (U3.7=C7.1). "
+                             "An IC's power pin belongs on a short track to its bypass "
+                             "capacitor, whose pad then carries the via -- the decoupling "
+                             "loop is pin -> cap -> plane, not pin -> plane with the cap "
+                             "hanging off the side. kad knows pin types; the board file "
+                             "does not, so name them here.")
+    parser.add_argument("--plane-pad-tap-annular-margin", type=float, default=0.0,
+                        metavar="MM",
+                        help="Pad copper to keep around a plane tap via, per side "
+                             "(default 0: the via need only fit).")
+    parser.add_argument("--no-via-in-pad-centering", dest="via_center_in_pad",
+                        action="store_false", default=True,
+                        help="Do NOT move an escape via that CLIPS its own pad to the pad "
+                             "centre. The default moves it: a via straddling a pad boundary "
+                             "is half in copper and half in solder mask, wicks solder down "
+                             "the barrel at reflow, and no DRC reports it (the pad adopts "
+                             "the via's net). Centring only ever applies where the via "
+                             "ALREADY overlaps its own pad AND fits wholly inside it, so it "
+                             "creates no via-in-pad site that did not already exist -- but "
+                             "every such site needs IPC-4761 Type VII (filled+capped) from "
+                             "the fab either way; see the via-in-pad note in the run summary.")
+    parser.add_argument("--via-in-pad-annular-margin", type=float, default=0.0,
+                        metavar="MM",
+                        help="Pad copper to keep around a centred via, per side (default 0: "
+                             "the via need only fit). Raise it to decline the move on pads "
+                             "that would be left with a hairline annulus.")
     parser.add_argument("--no-neck-nets", nargs="+", metavar="NET", default=None,
                         help="Nets whose clearance is a SAFETY floor (creepage on an HV net, "
                              "say) rather than a routing preference. The rescue ladder will not "
@@ -3533,6 +3688,13 @@ For differential pair routing, use route_diff.py:
                 # must see what the operator TYPED, not the expanded names.
                 net_name_patterns=all_patterns,
                 layers=args.layers,
+                via_center_in_pad=args.via_center_in_pad,
+                via_center_annular_margin=args.via_in_pad_annular_margin,
+                plane_pad_taps=args.plane_pad_taps,
+                plane_pad_tap_annular_margin=args.plane_pad_tap_annular_margin,
+                plane_pad_tap_skip=args.plane_tap_skip_pads,
+                allow_via_shrink=args.allow_via_shrink,
+                fanout_refs=args.fanout_refs,
                 track_width=args.track_width,
                 track_width_from_class=not _tw_explicit,
                 impedance=args.impedance,

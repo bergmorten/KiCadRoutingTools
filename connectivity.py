@@ -1336,6 +1336,99 @@ def _get_net_endpoints_ordered(pcb_data: PCBData, net_id: int, config: GridRoute
     return [], [], f"Cannot determine endpoints: {len(net_segments)} segments, {len(net_pads)} pads"
 
 
+
+
+def via_span_layers(via, layers):
+    """Every copper layer a via's barrel crosses, in stack order (#562).
+
+    ``via.layers`` names the two END layers. A through via listed as
+    ['F.Cu', 'B.Cu'] touches In1.Cu and In2.Cu too, and a pour on either is
+    connected to it. Falls back to the literal list when an end layer is not in
+    the routing stack (a layer the run was told not to use).
+    """
+    from net_queries import expand_pad_layers
+    ends = list(expand_pad_layers(list(getattr(via, 'layers', []) or []), layers))
+    idx = [layers.index(l) for l in ends if l in layers]
+    if len(idx) < 2:
+        return set(ends)
+    lo, hi = min(idx), max(idx)
+    return set(layers[lo:hi + 1])
+
+
+def pad_served_by_plane(pad, net_vias, zones, layers) -> bool:
+    """True when `pad` already reaches its own net's POUR and needs no routing (#561).
+
+    A net that owns a filled zone is tapped, not routed. The multipoint terminal
+    list was built from segments and vias only, so such a pad read as unconnected
+    however well the plane served it, and the router dutifully chained plane pads
+    across surface copper to reach each other -- the wide F.Cu ground fan with one
+    via at the end. Counting the pour as the connection it physically is removes
+    the reason for that copper to exist.
+
+    Served means the pad's copper reaches the pour, not merely that a pour exists:
+    the pad centre must lie INSIDE the zone outline, and one of
+
+      * the pad sits on the zone's own layer;
+      * the pad is through-hole, so its plated barrel crosses that layer;
+      * a same-net via lands inside the pad and its layer span covers that layer.
+
+    A pad outside the pour, or one whose via does not reach the zone layer, is not
+    served and stays a routing terminal.
+    """
+    from check_connected import point_in_polygon
+    from net_queries import expand_pad_layers
+
+    if not zones:
+        return False
+    pad_layers = set(expand_pad_layers(pad.layers, layers))
+    is_th = getattr(pad, 'pad_type', '') == 'thru_hole'
+    px, py = pad.global_x, pad.global_y
+    hx, hy = pad.size_x / 2.0, pad.size_y / 2.0
+
+    for z in zones:
+        if z.net_id != getattr(pad, 'net_id', 0):
+            continue
+        if not z.polygon or not point_in_polygon(px, py, z.polygon):
+            continue
+        if is_th or z.layer in pad_layers:
+            return True
+        for v in net_vias:
+            if abs(v.x - px) > hx or abs(v.y - py) > hy:
+                continue
+            if z.layer in via_span_layers(v, layers):
+                return True
+    return False
+
+
+
+def group_served_by_plane(group, net_vias, zones, layers, tol: float = 0.02) -> bool:
+    """True when a same-net copper island already reaches its own pour (#562).
+
+    A dog-bone fanout is a pad, a stub and a via: an island with no segment to
+    any other pad. Case 2 gives every island one MST terminal, so without this
+    the router joins the islands to EACH OTHER across the surface -- the exact
+    chain the fanout was placed to prevent. An island with a via that spans the
+    zone layer, at a point inside the zone outline, is connected through the
+    pour and needs nothing more.
+    """
+    from check_connected import point_in_polygon
+    from net_queries import expand_pad_layers
+    if not zones or not group:
+        return False
+    ends = set()
+    for s in group:
+        ends.add((round(s.start_x, 3), round(s.start_y, 3)))
+        ends.add((round(s.end_x, 3), round(s.end_y, 3)))
+    for v in net_vias:
+        if not any(abs(v.x - ex) <= tol and abs(v.y - ey) <= tol for ex, ey in ends):
+            continue
+        span = via_span_layers(v, layers)
+        for z in zones:
+            if z.layer in span and z.polygon and point_in_polygon(v.x, v.y, z.polygon):
+                return True
+    return False
+
+
 def get_multipoint_net_pads(*args, **kwargs):
     """Deterministic wrapper: order multi-point terminals by POSITION.
 
@@ -1402,6 +1495,18 @@ def _get_multipoint_net_pads_unordered(
     net_pads = [p for p in drop_off_board_pads(pcb_data, pcb_data.pads_by_net.get(net_id, []))
                 if (p.pad_number or '').strip() != '']
     net_vias = [v for v in pcb_data.vias if v.net_id == net_id]
+
+    # #561: a pad its own pour already reaches is not a routing terminal. Without
+    # this the router treats a plane net as an ordinary MST and chains its pads
+    # across surface copper to one distant via; with it, only the pads the plane
+    # does NOT reach remain, which is exactly the set that still needs copper.
+    _zones = [z for z in (getattr(pcb_data, 'zones', []) or []) if z.net_id == net_id]
+    _served = []
+    if _zones:
+        _served = [p for p in net_pads
+                   if pad_served_by_plane(p, net_vias, _zones, config.layers)]
+        if _served:
+            net_pads = [p for p in net_pads if p not in _served]
 
     # Case 1: No segments and 3+ pads
     if len(net_segments) == 0 and len(net_pads) >= 3:
@@ -1470,6 +1575,11 @@ def _get_multipoint_net_pads_unordered(
 
         endpoint_info = []
         for gi, group in enumerate(groups):
+            # #562: an island already tied into its own pour is not a terminal,
+            # and neither are the pads sitting on it.
+            if _zones and group_served_by_plane(group, net_vias, _zones, config.layers):
+                _served.extend(pads_on_group[gi])
+                continue
             # #545 F4: prefer a VIA of the group as its representative
             # terminal. The old choice, free_ends[0], is the SORTED-SMALLEST
             # free end -- an arbitrary geometric corner pinned to one
@@ -1533,6 +1643,34 @@ def _get_multipoint_net_pads_unordered(
 
         for pad in unconnected_pads:
             _append_pad(endpoint_info, pad)
+
+        # #562: a pad deliberately NOT fanned out (an IC power pin that must reach
+        # the pour THROUGH its bypass capacitor) needs a terminal to route TO.
+        # With every served pad dropped above, the only terminals left would be
+        # the un-tapped pins themselves, and the MST would join them to each
+        # other across the board -- U4's VCC to R11 -- with no path to the pour
+        # at all. Give each such pad its nearest served pad as an anchor: the
+        # cap sits closest by placement, so the MST edge is pin -> cap, and the
+        # cap's own via carries the current down.
+        if _zones and _served and unconnected_pads:
+            _anchored = set()
+            _wanted = getattr(config, 'plane_tap_anchors', None) or {}
+            for pad in unconnected_pads:
+                _key = f"{getattr(pad, 'component_ref', '')}.{getattr(pad, 'pad_number', '')}"
+                anchor = None
+                if _key in _wanted:
+                    anchor = next((q for q in _served
+                                   if f"{q.component_ref}.{q.pad_number}" == _wanted[_key]), None)
+                    if anchor is None:
+                        print(f"  plane-tap anchor {_wanted[_key]} for {_key} is not a served pad "
+                              f"of this net -- falling back to the nearest one")
+                if anchor is None:
+                    anchor = min(_served, key=lambda q: (q.global_x - pad.global_x) ** 2
+                                                        + (q.global_y - pad.global_y) ** 2)
+                if id(anchor) in _anchored:
+                    continue
+                _anchored.add(id(anchor))
+                _append_pad(endpoint_info, anchor)
 
         return endpoint_info if len(endpoint_info) >= 3 else None
 

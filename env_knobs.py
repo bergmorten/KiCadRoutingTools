@@ -122,6 +122,11 @@ def refresh() -> None:
     # --- strings -------------------------------------------------------------
     g['HYBRID_LEG_DEBUG'] = _s('KICAD_HYBRID_LEG_DEBUG')   # truthy; '2' = verbose
     g['LEDGER_TRACE'] = _s('KICAD_LEDGER_TRACE')
+    # #560: per-candidate trace for center_vias_in_same_net_pads -- prints WHICH
+    # guard declined each clipping via (clearance / drag / connectivity), because
+    # "20 vias were not centred" is not actionable and "20 declined on clearance
+    # to foreign copper already routed under the ball" is.
+    g['VIA_IN_PAD_DEBUG'] = _truthy('KICAD_VIA_IN_PAD_DEBUG')
     g['STOP_AFTER'] = _s('KICAD_STOP_AFTER')
     g['STOP_FILE'] = _s('KICAD_STOP_FILE')
     g['DUMP_BATCH_KWARGS'] = _s('KICAD_DUMP_BATCH_KWARGS')  # dump file path

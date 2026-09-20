@@ -41,6 +41,7 @@ from pcb_modification import (
     nudge_grazing_octolinear,
     nudge_grazing_microshift,
     nudge_grazing_vias,
+    center_vias_in_same_net_pads,
     prune_redundant_cycles,
     collapse_strict_redundant,
     remove_orphan_islands,
@@ -73,6 +74,8 @@ def run_post_route_cleanup(results, pcb_data, scope_net_ids, config, *,
                            graze: bool = True,
                            octolinear: bool = True,
                            via_nudge: bool = True,
+                           via_center_in_pad: bool = True,
+                           via_center_annular_margin: float = 0.0,
                            cycles: bool = True,
                            neck: bool = True,
                            microshift_max_shift: Optional[float] = None,
@@ -99,6 +102,10 @@ def run_post_route_cleanup(results, pcb_data, scope_net_ids, config, *,
       4. nudge_grazing_octolinear / 5. nudge_grazing_microshift /
       6. nudge_grazing_vias    -- re-bend / micro-shift load-bearing grazes the
                                   prune must keep (#224/#276/#280).
+      6b. center_vias_in_same_net_pads -- an escape via that CLIPS its own
+                                  pad edge is moved to the pad centre when it
+                                  fits (#560); after the nudge, so it sees
+                                  final via positions.
       7. prune_redundant_cycles -- per-net tree invariant (RAM_A9 loops).
       8. sweep_dead_ends       -- trim dead-end spurs and unsupported vias.
       9. neck_wide_segments_grazing_pads -- width-only fix for wide power
@@ -175,7 +182,12 @@ def run_post_route_cleanup(results, pcb_data, scope_net_ids, config, *,
             print(f"[LEDGER_TRACE]{label} after {stage}: ({tx},{ty}) "
                   f"board={nb} writelist={nr} strip={ns}")
 
+    _zn = {z.net_id for z in (getattr(pcb_data, 'zones', []) or [])}
+
     def _prog(stage):
+        if _zn and env_knobs.VIA_IN_PAD_DEBUG:
+            _n = sum(1 for _v in pcb_data.vias if _v.net_id in _zn)
+            print(f"[via-in-pad] before {stage}: {_n} plane-net via(s) on board")
         if progress_callback:
             progress_callback(0, 0, f"{label}Cleanup: {stage}...")
 
@@ -293,6 +305,27 @@ def run_post_route_cleanup(results, pcb_data, scope_net_ids, config, *,
         if _vn_moved:
             print(f"{label}Via nudge: moved {_vn_moved} grazing via(s) on "
                   f"{_vn_nets} net(s) by their sub-grid clearance shortfall (#280)")
+
+    if via_center_in_pad:
+        _prog("via centre-in-pad")
+        # AFTER the nudge: the nudge moves vias for clearance, and a via it
+        # shifted may only then be the clipping-a-own-pad case this fixes.
+        # The plane path hands in a SimpleNamespace(clearance, grid_step), not a
+        # RoutingConfig, so every field beyond those two is read with a default.
+        # #498: a .kicad_dru layer rule replaces the pair clearance on that layer;
+        # a via spans the stack, so it is graded at stack_clearance().
+        _vc_moved, _vc_nets, _ = center_vias_in_same_net_pads(
+            results, pcb_data, scope_net_ids, clearance=config.clearance,
+            hole_to_hole=getattr(config, 'hole_to_hole_clearance', 0.20),
+            net_clearances=_nc, board_edge_clearance=_bec,
+            annular_margin=via_center_annular_margin,
+            layer_clearance=getattr(config, 'layer_clearance', None),
+            stack_clearance=getattr(config, 'stack_clearance', None))
+        counts['vias_centred_in_pad'] = _vc_moved
+        _trace('via_center_in_pad')
+        if _vc_moved:
+            print(f"{label}Via centre-in-pad: moved {_vc_moved} via(s) on "
+                  f"{_vc_nets} net(s) from a pad EDGE to the pad centre (#560)")
 
     # #473 (extended): protected nets keep ALL their copper through EVERY
     # subtractive pass, not just the dead-end sweep. Cycle prune / strict
