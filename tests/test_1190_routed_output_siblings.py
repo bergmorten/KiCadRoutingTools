@@ -16,6 +16,9 @@ Checks:
   2. check_floorplan finds the brief beside the routed output.
   3. fix_project_for_output never overwrites a sibling the output already
      has.
+  4. #1286: route.py --no-fix-drc-settings skips that writeback, so the sibling
+     set has to travel with the seeded .kicad_pro: the output must still
+     carry the .kicad_dru (the custom rules kicad-cli grades it against).
 
     python3 tests/test_1190_routed_output_siblings.py
 """
@@ -85,6 +88,9 @@ def main():
             ('route_planes.py', ['py_router/route_planes.py', inp,
                                  os.path.join(tmp, 'pour.kicad_pcb'),
                                  '--nets', 'GND', '--plane-layers', 'B.Cu']),
+            ('route.py --no-fix-drc-settings',
+             ['py_router/route.py', inp, os.path.join(tmp, 'nofix.kicad_pcb'),
+              '--nets', '/EN', '--no-fix-drc-settings']),
         ]
         for name, argv in steps:
             rc, out = run(argv)

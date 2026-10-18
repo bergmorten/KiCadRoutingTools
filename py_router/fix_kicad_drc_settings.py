@@ -1898,6 +1898,32 @@ def apply_routed_floors(board_pcb: str, clearance=None, hole_clearance=None,
     return changes
 
 
+def carry_input_siblings(output_pcb: str, input_pcb=None):
+    """Carry the input's siblings other than the ``.kicad_pro``
+    (``copy_board.SIBLING_EXTS``) beside the output: the ``.kicad_dru`` (#498:
+    the router routed to its per-layer clearances, and every grader resolves
+    them from the OUTPUT board's sibling), the ``.design-brief.json`` (#711:
+    the declared intent, without which the next grade infers every edge from
+    the current pose, #1190) and the ``.kicad_prl``. Never overwrites an
+    existing output sibling. Returns the copied paths."""
+    import shutil
+    if not (output_pcb and input_pcb):
+        return []
+    from copy_board import SIBLING_EXTS
+    in_base = os.path.splitext(input_pcb)[0]
+    out_base = os.path.splitext(output_pcb)[0]
+    copied = []
+    for ext in SIBLING_EXTS:
+        if ext == ".kicad_pro":
+            continue                                      # the callers own it
+        src, dst = in_base + ext, out_base + ext
+        if os.path.isfile(src) and not os.path.isfile(dst) \
+                and os.path.abspath(src) != os.path.abspath(dst):
+            shutil.copyfile(src, dst)
+            copied.append(dst)
+    return copied
+
+
 def seed_project_for_output(output_pcb: str, input_pcb=None):
     """Carry the input board's sibling ``.kicad_pro`` over to the output path
     BEFORE the board file is written (#513 item 12). The full floor writeback
@@ -1908,10 +1934,16 @@ def seed_project_for_output(output_pcb: str, input_pcb=None):
     Seeding the input's project first means the window leaves the INPUT's
     floors -- slightly stale at worst, never the stock fallback. Idempotent:
     an existing output project is never touched. Returns the seeded path or
-    None."""
+    None.
+
+    The rest of the sibling set travels here too (:func:`carry_input_siblings`):
+    ``--no-fix-drc-settings`` skips :func:`fix_project_for_output`, and its
+    output used to reach kicad-cli with the ``.kicad_pro`` alone -- graded
+    without the board's ``.kicad_dru`` custom rules (#1286)."""
     import shutil
     if not output_pcb:
         return None
+    carry_input_siblings(output_pcb, input_pcb)
     out_pro = find_project(output_pcb)
     if os.path.isfile(out_pro):
         return None
@@ -2034,23 +2066,7 @@ def fix_project_for_output(output_pcb: str, input_pcb=None, *, clearance=None,
                            "meta": {"filename": os.path.basename(out_pro), "version": 1},
                            "net_settings": {"classes": [], "meta": {"version": 0}}},
                           f, indent=2)
-    # Carry the input's other siblings (copy_board.SIBLING_EXTS) the same way:
-    # the .kicad_dru (#498: the router routed to its per-layer clearances, and
-    # every grader resolves them from the OUTPUT board's sibling), the
-    # .design-brief.json (#711: the declared intent, without which the next
-    # grade infers every edge from the current pose, #1190) and the .kicad_prl.
-    # Never overwrite an existing output sibling.
-    if input_pcb:
-        from copy_board import SIBLING_EXTS
-        in_base = os.path.splitext(input_pcb)[0]
-        out_base = os.path.splitext(output_pcb)[0]
-        for ext in SIBLING_EXTS:
-            if ext == ".kicad_pro":
-                continue                                  # handled above
-            src, dst = in_base + ext, out_base + ext
-            if os.path.isfile(src) and not os.path.isfile(dst) \
-                    and os.path.abspath(src) != os.path.abspath(dst):
-                shutil.copyfile(src, dst)
+    carry_input_siblings(output_pcb, input_pcb)
 
     # The records (origin, protected nets, ...) as the board holds them: the
     # newer of the project's copy and the board file's, which is where a GUI
