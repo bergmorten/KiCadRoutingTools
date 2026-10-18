@@ -58,7 +58,13 @@ orthogonal to the tier and bounds every descent site in the engine:
                    ``--clearance`` / ``--clearance-ceiling``) descends no
                    clearance at all. ``.kicad_dru`` layer rules and pad
                    clearance overrides keep their usual precedence: they
-                   replace the base clearance where they apply.
+                   replace the base clearance where they apply. Every OTHER
+                   rule the project leaves unset (track width, via size and
+                   drill, annular ring, hole-to-hole, copper-to-edge) is
+                   floored at pcbnew's factory value, which is what KiCad
+                   grades an undeclared rule at (#1287,
+                   :func:`floor_unset_at_kicad_defaults`), instead of falling
+                   through to the fab tier.
   - ``fab``    (default) additionally may go below the board's floors down to
                the fab tier floor (the pre-#857 reach), disclosed.
 
@@ -306,6 +312,72 @@ def floor_board_clearance_at_class(floors, graded_clearance,
                   f"descents stop at {target:g} mm, the clearance KiCad grades "
                   f"the unchanged project's Default nets at (was "
                   f"{'unset' if prev is None else f'{prev:g} mm'}; #1262)")
+    return out
+
+
+#: The floor KiCad grades each FLOOR_KEYS rule at when the project leaves its
+#: ``rules.min_*`` key unset: pcbnew's BOARD_DESIGN_SETTINGS factory value
+#: (``DEFAULT_TRACKMINWIDTH`` 0.2, ``DEFAULT_VIASMINSIZE`` 0.5,
+#: ``DEFAULT_MINTHROUGHDRILL`` 0.3, ``DEFAULT_HOLETOHOLEMIN`` 0.25,
+#: ``DEFAULT_COPPEREDGECLEARANCE`` 0.5; the annular ring derived from the via
+#: pair, (0.5 - 0.3) / 2 = 0.1), read on KiCad 10 through
+#: ``fix_kicad_drc_settings.pcbnew_rule_defaults``. A static table because the
+#: CLI has no pcbnew; tests/test_1287_board_unset_floors_kicad_default.py
+#: checks it against pcbnew when pcbnew imports. Clearance is not here: an
+#: unset ``min_clearance`` grades at the Default class (#1160/#1262).
+KICAD_FACTORY_FLOORS = {
+    'track_width': 0.2,
+    'via_diameter': 0.5,
+    'via_drill': 0.3,
+    'hole_to_hole': 0.25,
+    'annular': 0.1,
+    'board_edge': 0.5,
+}
+
+
+def floor_unset_at_kicad_defaults(floors, requested=None, announce=True):
+    """``--escalation board`` when the project writeback will NOT run: floor
+    each rule the project leaves unset at what KiCad grades it at.
+
+    :func:`board_floors_from_rules` reads an unset (absent or 0) ``rules.min_*``
+    key as "no board floor", so a descent for that key fell through to the fab
+    tier. With the writeback, the output project's floor is then lowered to
+    what was routed and KiCad grades the board clean. Without it
+    (``--no-fix-drc-settings``, the GUI's "Fix DRC settings after routing"
+    unticked) the input project ships unchanged and KiCad grades the key at
+    pcbnew's factory value (:data:`KICAD_FACTORY_FLOORS`): a net rescue that
+    laid 0.0889 mm track on a project with no ``min_track_width`` shipped 43
+    ``track_width`` violations against KiCad's 0.2 mm, every one legal in the
+    run's own ledger.
+
+    Each unset key is floored at the factory value. A run whose own request
+    for that key is already below it (``--track-width 0.15`` on such a
+    project) keeps the REQUEST as the floor -- no descent below it -- the same
+    rule :func:`floor_board_clearance_at_class` applies to clearance; the
+    request itself is the operator's call. Declared keys are untouched.
+    Returns the new floors dict."""
+    out = dict(floors or {})
+    req = {}
+    for name, val in (requested or {}).items():
+        key = _REQUEST_FLOOR_KEY.get(name)
+        try:
+            if key and val is not None and float(val) > 0:
+                req[key] = min(float(val), req.get(key, float(val)))
+        except (TypeError, ValueError):
+            pass
+    added = []
+    for key, factory in KICAD_FACTORY_FLOORS.items():
+        if key in out:
+            continue
+        target = factory
+        if key in req and req[key] < factory - 1e-9:
+            target = req[key]
+        out[key] = target
+        added.append(f"{key} {target:g}")
+    if announce and added:
+        print(f"  --escalation board, project writeback off: rules the project "
+              f"leaves unset are floored at what KiCad grades them at: "
+              f"{', '.join(added)} mm (#1287)")
     return out
 
 
@@ -1018,7 +1090,9 @@ def add_fab_tier_args(parser, *, include_escalation=True):
                  "the clearance used, which the DRC-settings writeback does; with "
                  "--no-fix-drc-settings the project is left as it was, so "
                  "clearance descents stop at the Default class (floored at "
-                 "min_clearance), what KiCad grades it at (#1262). 'fab': down to "
+                 "min_clearance), what KiCad grades it at (#1262), and a rule "
+                 "the project leaves unset stops at KiCad's factory value, e.g. "
+                 "0.2 mm track (#1287). 'fab': down to "
                  "the fab tier floor, below the board's own minimums. Every "
                  "descent is counted in JSON_SUMMARY design_rules.")
         parser.add_argument(
@@ -1171,7 +1245,9 @@ def board_policy_floors(policy, floors, requested, graded_clearance,
     (:func:`drop_stale_board_floors`), and when the project ``writeback`` will
     not run the clearance floor is the clearance KiCad grades the unchanged
     project's Default nets at, ``graded_clearance``
-    (:func:`floor_board_clearance_at_class`, #1262)."""
+    (:func:`floor_board_clearance_at_class`, #1262), and every other rule the
+    project leaves unset is floored at KiCad's factory value
+    (:func:`floor_unset_at_kicad_defaults`, #1287)."""
     if policy != 'board':
         return dict(floors or {})
     if writeback:
@@ -1179,5 +1255,8 @@ def board_policy_floors(policy, floors, requested, graded_clearance,
     out = drop_stale_board_floors(
         floors, {k: v for k, v in (requested or {}).items()
                  if _REQUEST_FLOOR_KEY.get(k) != 'clearance'})
+    out = floor_unset_at_kicad_defaults(
+        out, {k: v for k, v in (requested or {}).items()
+              if _REQUEST_FLOOR_KEY.get(k) != 'clearance'})
     return floor_board_clearance_at_class(
         out, graded_clearance, (requested or {}).get('clearance'))
